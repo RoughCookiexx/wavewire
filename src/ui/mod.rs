@@ -1,23 +1,23 @@
 use anyhow::Result;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
-    Frame,
 };
 use termion::event::Key;
 
 use crate::audio::{AudioEngine, AudioEvent, DeviceInfo};
-use std::collections::{HashMap, HashSet};
 use crate::audio::{DeviceId, SpectrumData};
+use std::collections::{HashMap, HashSet};
 
 /// Minimum terminal height for full layout (with device list and tabs)
 /// Below this threshold, only spectrum is displayed
-const MIN_HEIGHT_FOR_FULL_LAYOUT: u16 = 20;
+const MIN_HEIGHT_FOR_FULL_LAYOUT: u16 = 60;
 
 /// Height reserved for the spectrum visualization in full layout
-const SPECTRUM_HEIGHT: u16 = 8;
+const SPECTRUM_HEIGHT: u16 = 32;
 
 /// Width of the left navigation panel (device list)
 const DEVICE_LIST_WIDTH: u16 = 30;
@@ -163,15 +163,13 @@ impl App {
                     source,
                     destination,
                 } => {
-                    self.status_message =
-                        format!("Connected: {} -> {}", source, destination);
+                    self.status_message = format!("Connected: {} -> {}", source, destination);
                 }
                 AudioEvent::ConnectionBroken {
                     source,
                     destination,
                 } => {
-                    self.status_message =
-                        format!("Disconnected: {} -> {}", source, destination);
+                    self.status_message = format!("Disconnected: {} -> {}", source, destination);
                 }
                 AudioEvent::Xrun => {
                     self.status_message = String::from("Audio buffer xrun occurred");
@@ -181,12 +179,16 @@ impl App {
                 }
                 AudioEvent::VisualizationStarted { device_id, port_id } => {
                     self.visualized_devices.insert(*device_id);
-                    self.status_message = format!("Visualization started for device {:?}, port {:?}", device_id, port_id);
+                    self.status_message = format!(
+                        "Visualization started for device {:?}, port {:?}",
+                        device_id, port_id
+                    );
                 }
                 AudioEvent::VisualizationStopped { device_id } => {
                     self.visualized_devices.remove(device_id);
                     self.spectrum_data.remove(device_id);
-                    self.status_message = format!("Visualization stopped for device {:?}", device_id);
+                    self.status_message =
+                        format!("Visualization stopped for device {:?}", device_id);
                 }
                 AudioEvent::SpectrumUpdate { device_id, data } => {
                     crate::debug_log!(
@@ -272,9 +274,9 @@ impl App {
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(0),                // Content area (device list + main content)
+                Constraint::Min(0),                  // Content area (device list + main content)
                 Constraint::Length(SPECTRUM_HEIGHT), // Spectrum visualization
-                Constraint::Length(3),             // Status bar
+                Constraint::Length(3),               // Status bar
             ])
             .split(frame.area());
 
@@ -283,7 +285,7 @@ impl App {
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(DEVICE_LIST_WIDTH), // Device list
-                Constraint::Min(0),                     // Main content area
+                Constraint::Min(0),                    // Main content area
             ])
             .split(main_chunks[0]);
 
@@ -311,12 +313,18 @@ impl App {
                 let line = Line::from(vec![
                     Span::styled(
                         indicator,
-                        Style::default().fg(if is_visualized { Color::Cyan } else { Color::DarkGray }),
+                        Style::default().fg(if is_visualized {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        }),
                     ),
                     Span::raw(" "),
                     Span::styled(
                         &device.name,
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(" "),
                     Span::styled(
@@ -447,9 +455,11 @@ impl App {
                 .title("Frequency Spectrum - Combined View")
                 .title_alignment(Alignment::Left);
 
-            let paragraph = Paragraph::new("No devices visualized\n\nPress Space on a device to start visualization")
-                .block(block)
-                .alignment(Alignment::Center);
+            let paragraph = Paragraph::new(
+                "No devices visualized\n\nPress Space on a device to start visualization",
+            )
+            .block(block)
+            .alignment(Alignment::Center);
 
             frame.render_widget(paragraph, area);
             return;
@@ -460,7 +470,9 @@ impl App {
         device_ids.sort_by_key(|id| id.0); // Sort for consistent ordering
 
         // Check if we have spectrum data for any device
-        let has_data = device_ids.iter().any(|id| self.spectrum_data.contains_key(id));
+        let has_data = device_ids
+            .iter()
+            .any(|id| self.spectrum_data.contains_key(id));
         if !has_data {
             let block = Block::default()
                 .borders(Borders::ALL)
@@ -476,7 +488,8 @@ impl App {
             .iter()
             .enumerate()
             .map(|(idx, &device_id)| {
-                let name = self.devices
+                let name = self
+                    .devices
                     .iter()
                     .find(|d| d.id == device_id)
                     .map(|d| d.name.as_str())
@@ -516,8 +529,13 @@ impl App {
         }
     }
 
-    fn render_combined_spectrum(&self, frame: &mut Frame, area: Rect, title: &str, device_ids: &[DeviceId]) {
-
+    fn render_combined_spectrum(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        title: &str,
+        device_ids: &[DeviceId],
+    ) {
         let num_devices = device_ids.len();
 
         // Get first device's spectrum to determine number of bins
@@ -535,7 +553,9 @@ impl App {
         let space_per_group = 1;
         let total_per_group = bars_per_group + space_per_group;
 
-        let num_groups = (available_width / total_per_group).max(1).min(num_frequency_bins);
+        let num_groups = (available_width / total_per_group)
+            .max(1)
+            .min(num_frequency_bins);
 
         // Build bar chart data: for each frequency bin, add bars for all devices
         let mut bars_data: Vec<(&str, u64)> = Vec::new();
@@ -560,13 +580,21 @@ impl App {
                 // Diagnostic logging (log occasionally)
                 if device_idx == 0 && bin_idx % 16 == 0 {
                     crate::debug_log!(
-                        "[RENDER] Device {:?}, bin {}: magnitude={:.2} dB, display_value={}",
-                        device_id, bin_idx, magnitude, ((magnitude + 60.0).max(0.0).min(60.0)) as u64
+                        "[RENDER] Device {:?}, bin {}: magnitude={:.2} dB",
+                        device_id,
+                        bin_idx,
+                        magnitude
                     );
                 }
 
-                // Convert dB to display value (0-60 range, since we store -60 to 0 dB)
-                let display_value = ((magnitude + 60.0).max(0.0).min(60.0)) as u64;
+                // Convert dB to display value with amplification
+                // Original range: -60 to 0 dB
+                // Amplify by 3x to make quiet signals more visible
+                // Apply baseline offset so there's always something visible
+                let normalized = (magnitude + 60.0).max(0.0).min(60.0); // 0-60 range
+                let amplified = (normalized * 3.0).min(60.0); // Amplify by 3x, cap at 60
+                let with_baseline = amplified + 5.0; // Add 5-point baseline so bars are always visible
+                let display_value = with_baseline as u64;
 
                 // Add bar
                 bars_data.push(("", display_value));
@@ -609,34 +637,82 @@ impl App {
         let bar_height_area = inner.height.saturating_sub(1);
         let label_y = inner.y + bar_height_area;
 
-        let max_height = 60.0; // Max dB range
-        let bar_width = 1;
+        // Max height accounts for baseline (5) + amplified range (60)
+        let max_height = 65.0; // Baseline (5) + max amplified dB (60)
 
-        // Render each bar using Block widgets
+        // With braille, each terminal row represents 4 vertical pixels
+        let braille_pixels_per_row = 4;
+        let total_vertical_pixels = bar_height_area as usize * braille_pixels_per_row;
+
+        // Render each bar using braille characters for better vertical resolution
         for (i, ((_label, value), style)) in bars.iter().zip(bar_styles.iter()).enumerate() {
             if i >= inner.width as usize {
                 break;
             }
 
-            let bar_height = (*value as f32 / max_height * bar_height_area as f32) as u16;
-            let bar_height = bar_height.min(bar_height_area);
+            // Calculate height in braille pixels (4x resolution)
+            let bar_height_pixels = (*value as f32 / max_height * total_vertical_pixels as f32) as usize;
+            let bar_height_pixels = bar_height_pixels.min(total_vertical_pixels).max(1);
 
-            if bar_height > 0 {
-                let bar_area = Rect {
-                    x: inner.x + i as u16,
-                    y: inner.y + bar_height_area - bar_height,
-                    width: bar_width,
-                    height: bar_height,
-                };
+            if bar_height_pixels > 0 {
+                let x = inner.x + i as u16;
 
-                // Render a filled block for the bar
-                let bar_block = Block::default().style(*style);
-                frame.render_widget(bar_block, bar_area);
+                // Calculate how many full rows and remaining pixels
+                let full_rows = bar_height_pixels / braille_pixels_per_row;
+                let remaining_pixels = bar_height_pixels % braille_pixels_per_row;
+
+                // Start from bottom
+                let bottom_row = inner.y + bar_height_area - 1;
+
+                // Render full rows with full braille character
+                for row in 0..full_rows {
+                    let y = bottom_row.saturating_sub(row as u16);
+                    if y >= inner.y && y < inner.y + bar_height_area {
+                        let cell = frame.buffer_mut().cell_mut((x, y)).unwrap();
+                        // Full column: left column filled (dots 1,2,3,4)
+                        cell.set_symbol(Self::braille_char(0b1111));
+                        cell.set_style(*style);
+                    }
+                }
+
+                // Render partial row at top if needed
+                if remaining_pixels > 0 && full_rows < bar_height_area as usize {
+                    let y = bottom_row.saturating_sub(full_rows as u16);
+                    if y >= inner.y && y < inner.y + bar_height_area {
+                        let cell = frame.buffer_mut().cell_mut((x, y)).unwrap();
+                        // Partial column: fill from bottom
+                        let pattern = match remaining_pixels {
+                            1 => 0b0001, // Bottom dot only
+                            2 => 0b0011, // Bottom 2 dots
+                            3 => 0b0111, // Bottom 3 dots
+                            _ => 0b1111, // All dots
+                        };
+                        cell.set_symbol(Self::braille_char(pattern));
+                        cell.set_style(*style);
+                    }
+                }
             }
         }
 
         // Render frequency labels at the bottom
         self.render_frequency_labels(frame, inner, label_y);
+    }
+
+    /// Convert a 4-bit pattern to a braille character (both columns filled)
+    /// Bit 0 = level 1 (bottom), bit 1 = level 2, bit 2 = level 3, bit 3 = level 4 (top)
+    /// Braille layout: 1 4
+    ///                 2 5
+    ///                 3 6
+    ///                 7 8
+    fn braille_char(pattern: u8) -> &'static str {
+        match pattern {
+            0b0000 => "⠀", // blank
+            0b0001 => "⣀", // bottom row only (dots 7,8)
+            0b0011 => "⣤", // bottom 2 rows (dots 3,6,7,8)
+            0b0111 => "⣶", // bottom 3 rows (dots 2,3,5,6,7,8)
+            0b1111 => "⣿", // all 4 rows (full block)
+            _ => "⠀", // default to blank for other patterns
+        }
     }
 
     fn render_frequency_labels(&self, frame: &mut Frame, inner: Rect, y: u16) {
@@ -666,8 +742,7 @@ impl App {
                     height: 1,
                 };
 
-                let text = Paragraph::new(*label)
-                    .style(Style::default().fg(Color::DarkGray));
+                let text = Paragraph::new(*label).style(Style::default().fg(Color::DarkGray));
 
                 frame.render_widget(text, label_area);
             }
@@ -675,30 +750,28 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let status_text = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Status: ",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(&self.status_message, Style::default().fg(Color::White)),
-                Span::raw("  |  "),
-                Span::styled("q", Style::default().fg(Color::Cyan)),
-                Span::raw(": quit  "),
-                Span::styled("Tab", Style::default().fg(Color::Cyan)),
-                Span::raw(": switch tab  "),
-                Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
-                Span::raw(": select device  "),
-                Span::styled("r", Style::default().fg(Color::Cyan)),
-                Span::raw(": refresh  "),
-                Span::styled("Space", Style::default().fg(Color::Cyan)),
-                Span::raw(": toggle viz  "),
-                Span::styled("n", Style::default().fg(Color::Cyan)),
-                Span::raw(": new device"),
-            ]),
-        ];
+        let status_text = vec![Line::from(vec![
+            Span::styled(
+                "Status: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(&self.status_message, Style::default().fg(Color::White)),
+            Span::raw("  |  "),
+            Span::styled("q", Style::default().fg(Color::Cyan)),
+            Span::raw(": quit  "),
+            Span::styled("Tab", Style::default().fg(Color::Cyan)),
+            Span::raw(": switch tab  "),
+            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+            Span::raw(": select device  "),
+            Span::styled("r", Style::default().fg(Color::Cyan)),
+            Span::raw(": refresh  "),
+            Span::styled("Space", Style::default().fg(Color::Cyan)),
+            Span::raw(": toggle viz  "),
+            Span::styled("n", Style::default().fg(Color::Cyan)),
+            Span::raw(": new device"),
+        ])];
 
         let paragraph = Paragraph::new(status_text)
             .block(Block::default().borders(Borders::ALL))
