@@ -1,23 +1,49 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::audio::{DeviceId, DeviceInfo};
+use crate::audio::{DeviceId, DeviceInfo, EqSettings};
 use crate::debug_log;
 
 /// Main configuration structure
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub visualization: VisualizationConfig,
+    #[serde(default)]
+    pub eq: EqConfig,
 }
 
 /// Configuration for spectrum visualization
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisualizationConfig {
     /// Device names to visualize (matched by name on restore)
     pub enabled_devices: Vec<String>,
+    /// Spectrum amplification factor (default: 2.0)
+    #[serde(default = "default_amplification")]
+    pub spectrum_amplification: f32,
+}
+
+fn default_amplification() -> f32 {
+    2.0
+}
+
+impl Default for VisualizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled_devices: Vec::new(),
+            spectrum_amplification: default_amplification(),
+        }
+    }
+}
+
+/// Configuration for equalizer settings per device
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EqConfig {
+    /// Map of device name → EQ settings
+    /// Uses device names (not IDs) for persistence across sessions
+    pub device_settings: HashMap<String, EqSettings>,
 }
 
 impl Config {
@@ -26,6 +52,7 @@ impl Config {
     pub fn from_visualized_devices(
         visualized_ids: &HashSet<DeviceId>,
         all_devices: &[DeviceInfo],
+        spectrum_amplification: f32,
     ) -> Self {
         let enabled_devices = all_devices
             .iter()
@@ -34,7 +61,11 @@ impl Config {
             .collect();
 
         Config {
-            visualization: VisualizationConfig { enabled_devices },
+            visualization: VisualizationConfig {
+                enabled_devices,
+                spectrum_amplification,
+            },
+            eq: EqConfig::default(),
         }
     }
 }

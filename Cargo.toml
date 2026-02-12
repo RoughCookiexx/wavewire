@@ -16,6 +16,7 @@ termion = "4.0"
 
 # FFT and signal processing
 rustfft = "6.2"
+biquad = "0.4"
 
 # Error handling
 anyhow = "1.0"

@@ -50,15 +50,15 @@ fn run_app() -> Result<()> {
     let mut audio_engine = AudioEngine::new()?;
     audio_engine.start()?;
 
-    // Initialize UI app
-    let mut app = App::new();
-
     // Load configuration
     let config_manager = ConfigManager::new()?;
     let config = config_manager.load().unwrap_or_else(|e| {
         debug_log!("Failed to load config: {}, using defaults", e);
         Config::default()
     });
+
+    // Initialize UI app
+    let mut app = App::new(config.visualization.spectrum_amplification);
 
     // Set up non-blocking input handling
     let input_rx = spawn_input_thread();
@@ -124,7 +124,11 @@ fn run_app() -> Result<()> {
         // Auto-save config if needed (debounced)
         if app.should_auto_save() {
             let devices = audio_engine.list_devices().unwrap_or_default();
-            let config = Config::from_visualized_devices(&app.get_visualized_devices(), &devices);
+            let config = Config::from_visualized_devices(
+                &app.get_visualized_devices(),
+                &devices,
+                app.get_spectrum_amplification(),
+            );
             if let Err(e) = config_manager.save(&config) {
                 debug_log!("Auto-save failed: {}", e);
             } else {
@@ -150,7 +154,11 @@ fn run_app() -> Result<()> {
 
     // Save configuration before cleanup
     let devices = audio_engine.list_devices().unwrap_or_default();
-    let final_config = Config::from_visualized_devices(&app.get_visualized_devices(), &devices);
+    let final_config = Config::from_visualized_devices(
+        &app.get_visualized_devices(),
+        &devices,
+        app.get_spectrum_amplification(),
+    );
     if let Err(e) = config_manager.save(&final_config) {
         debug_log!("Failed to save config on exit: {}", e);
     } else {

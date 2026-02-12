@@ -62,9 +62,9 @@ impl FftProcessor {
     /// Human hearing is logarithmic, so we use more bins for low frequencies
     /// and fewer bins for high frequencies.
     ///
-    /// Frequency range: 20 Hz to 20 kHz (human audible range)
+    /// Frequency range: 18 Hz to 20 kHz (extended low-frequency range)
     fn generate_log_bin_edges(num_bins: usize, sample_rate: u32) -> Vec<f32> {
-        const MIN_FREQ: f32 = 20.0; // 20 Hz
+        const MIN_FREQ: f32 = 18.0; // 18 Hz (10% lower than standard 20 Hz)
         let max_freq = (sample_rate as f32 / 2.0).min(20000.0); // Nyquist or 20 kHz
 
         let log_min = MIN_FREQ.ln();
@@ -194,8 +194,8 @@ mod tests {
     fn test_log_bin_edges() {
         let edges = FftProcessor::generate_log_bin_edges(10, 48000);
         assert_eq!(edges.len(), 11); // num_bins + 1
-        // First edge should be close to 20 Hz
-        assert!((edges[0] - 20.0).abs() < 1.0);
+        // First edge should be close to 18 Hz
+        assert!((edges[0] - 18.0).abs() < 1.0);
         // Edges should be increasing
         for i in 1..edges.len() {
             assert!(edges[i] > edges[i - 1]);

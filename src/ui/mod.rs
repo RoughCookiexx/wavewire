@@ -8,8 +8,8 @@ use ratatui::{
 };
 use termion::event::Key;
 
-use crate::audio::{AudioEngine, AudioEvent, DeviceInfo};
-use crate::audio::{DeviceId, SpectrumData};
+use crate::audio::{AudioEngine, AudioEvent, DeviceInfo, EqSettings};
+use crate::audio::{AudioCommand, DeviceId, SpectrumData};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -56,6 +56,17 @@ impl DeviceTab {
     }
 }
 
+/// Focus mode for UI interaction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FocusMode {
+    /// Normal mode: device list focus
+    DeviceList,
+    /// Filters tab: focused on filter options
+    FiltersTab,
+    /// Spectrum mode: EQ band adjustment
+    SpectrumEq,
+}
+
 pub struct App {
     pub running: bool,
     current_tab: DeviceTab,
@@ -70,10 +81,22 @@ pub struct App {
     last_viz_change: Option<Instant>,
     /// Dirty flag indicating unsaved changes
     config_dirty: bool,
+    /// Spectrum amplification factor
+    pub spectrum_amplification: f32,
+    /// Current focus mode
+    focus_mode: FocusMode,
+    /// Selected filter option (0 = equalizer)
+    selected_filter: usize,
+    /// Selected EQ band (0-9) when in SpectrumEq mode
+    selected_eq_band: usize,
+    /// Devices with EQ enabled
+    eq_enabled_devices: HashSet<DeviceId>,
+    /// Current EQ settings per device
+    eq_settings: HashMap<DeviceId, EqSettings>,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(spectrum_amplification: f32) -> Self {
         Self {
             running: true,
             current_tab: DeviceTab::Routing,
@@ -84,10 +107,27 @@ impl App {
             spectrum_data: HashMap::new(),
             last_viz_change: None,
             config_dirty: false,
+            spectrum_amplification,
+            focus_mode: FocusMode::DeviceList,
+            selected_filter: 0,
+            selected_eq_band: 0,
+            eq_enabled_devices: HashSet::new(),
+            eq_settings: HashMap::new(),
         }
     }
 
     pub fn handle_input(&mut self, key: Key, audio_engine: &mut AudioEngine) -> Result<()> {
+        // Handle input based on focus mode
+        match self.focus_mode {
+            FocusMode::DeviceList => self.handle_device_list_input(key, audio_engine)?,
+            FocusMode::FiltersTab => self.handle_filters_tab_input(key, audio_engine)?,
+            FocusMode::SpectrumEq => self.handle_spectrum_eq_input(key, audio_engine)?,
+        }
+
+        Ok(())
+    }
+
+    fn handle_device_list_input(&mut self, key: Key, audio_engine: &mut AudioEngine) -> Result<()> {
         match key {
             // Global keys
             Key::Char('q') | Key::Esc | Key::Ctrl('c') => {
@@ -113,6 +153,13 @@ impl App {
                     self.selected_device += 1;
                 }
             }
+            Key::Char('\n') => {
+                // Enter key: move focus to filters tab
+                if self.current_tab == DeviceTab::Filters {
+                    self.focus_mode = FocusMode::FiltersTab;
+                    self.status_message = String::from("Filters tab - Press Space to enable EQ");
+                }
+            }
             Key::Char('r') => {
                 // Refresh device list
                 self.refresh_devices(audio_engine)?;
@@ -126,28 +173,145 @@ impl App {
                 // Toggle visualization for selected device
                 self.toggle_visualization(audio_engine)?;
             }
-            // Tab-specific input handling
-            _ => {
-                self.handle_tab_input(key, audio_engine)?;
+            Key::Char('o') => {
+                // Decrease spectrum amplification
+                self.spectrum_amplification = (self.spectrum_amplification - 0.1).max(0.1);
+                self.status_message = format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
+                self.config_dirty = true;
+                self.last_viz_change = Some(Instant::now());
             }
+            Key::Char('p') => {
+                // Increase spectrum amplification
+                self.spectrum_amplification = (self.spectrum_amplification + 0.1).min(10.0);
+                self.status_message = format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
+                self.config_dirty = true;
+                self.last_viz_change = Some(Instant::now());
+            }
+            _ => {}
         }
 
         Ok(())
     }
 
-    fn handle_tab_input(&mut self, key: Key, _audio_engine: &mut AudioEngine) -> Result<()> {
-        match self.current_tab {
-            DeviceTab::Routing => {
-                // Placeholder for routing tab input
-                match key {
-                    _ => {}
+    fn handle_filters_tab_input(&mut self, key: Key, audio_engine: &mut AudioEngine) -> Result<()> {
+        match key {
+            Key::Char('q') | Key::Ctrl('c') => {
+                self.running = false;
+            }
+            Key::Esc | Key::Backspace => {
+                // Return to device list mode
+                self.focus_mode = FocusMode::DeviceList;
+                self.status_message = String::from("Returned to device list");
+            }
+            Key::Char(' ') => {
+                // Toggle EQ for selected device
+                if let Some(device) = self.devices.get(self.selected_device) {
+                    let device_id = device.id;
+                    if self.eq_enabled_devices.contains(&device_id) {
+                        // EQ already enabled, move to spectrum mode
+                        self.focus_mode = FocusMode::SpectrumEq;
+                        self.status_message = format!("EQ adjustment mode - h/j: adjust gain, k/l: change band (currently at {}Hz)",
+                            self.get_current_band_frequency());
+                    } else {
+                        // Enable EQ
+                        self.enable_eq(device_id, audio_engine)?;
+                    }
                 }
             }
-            DeviceTab::Filters => {
-                // Placeholder for filters tab input
-                match key {
-                    _ => {}
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn handle_spectrum_eq_input(&mut self, key: Key, audio_engine: &mut AudioEngine) -> Result<()> {
+        match key {
+            Key::Char('q') | Key::Ctrl('c') => {
+                self.running = false;
+            }
+            Key::Esc | Key::Char(' ') | Key::Backspace => {
+                // Return to filters tab
+                self.focus_mode = FocusMode::FiltersTab;
+                self.status_message = String::from("Returned to filters tab");
+            }
+            Key::Char('h') => {
+                // Increase gain at selected band
+                self.adjust_eq_gain(1.0, audio_engine)?;
+            }
+            Key::Char('j') => {
+                // Decrease gain at selected band
+                self.adjust_eq_gain(-1.0, audio_engine)?;
+            }
+            Key::Char('k') => {
+                // Move to previous band
+                if self.selected_eq_band > 0 {
+                    self.selected_eq_band -= 1;
+                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
                 }
+            }
+            Key::Char('l') => {
+                // Move to next band
+                if self.selected_eq_band < 9 {
+                    self.selected_eq_band += 1;
+                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                }
+            }
+            Key::Left => {
+                // Move to previous band (alternative)
+                if self.selected_eq_band > 0 {
+                    self.selected_eq_band -= 1;
+                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                }
+            }
+            Key::Right => {
+                // Move to next band (alternative)
+                if self.selected_eq_band < 9 {
+                    self.selected_eq_band += 1;
+                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    fn get_current_band_frequency(&self) -> u32 {
+        const BANDS: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+        BANDS[self.selected_eq_band]
+    }
+
+    fn enable_eq(&mut self, device_id: DeviceId, audio_engine: &AudioEngine) -> Result<()> {
+        let settings = EqSettings::default();
+        audio_engine.send_command(AudioCommand::EnableEq {
+            device_id,
+            settings: settings.clone(),
+        })?;
+        // Don't optimistically update state - wait for EqEnabled event confirmation
+        self.status_message = String::from("Enabling EQ... (check logs for errors)");
+        Ok(())
+    }
+
+    fn adjust_eq_gain(&mut self, delta: f32, audio_engine: &AudioEngine) -> Result<()> {
+        if let Some(device) = self.devices.get(self.selected_device) {
+            let device_id = device.id;
+            if let Some(settings) = self.eq_settings.get_mut(&device_id) {
+                let current_gain = settings.bands[self.selected_eq_band].gain_db;
+                let new_gain = (current_gain + delta).clamp(-12.0, 12.0);
+                settings.bands[self.selected_eq_band].gain_db = new_gain;
+
+                audio_engine.send_command(AudioCommand::SetEqBand {
+                    device_id,
+                    band_index: self.selected_eq_band,
+                    gain_db: new_gain,
+                    q_value: settings.bands[self.selected_eq_band].q_value,
+                })?;
+
+                self.status_message = format!(
+                    "{}Hz: {:.1}dB",
+                    self.get_current_band_frequency(),
+                    new_gain
+                );
             }
         }
         Ok(())
@@ -211,6 +375,24 @@ impl App {
                         data.bins.get(63).unwrap_or(&-60.0)
                     );
                     self.spectrum_data.insert(*device_id, data.clone());
+                }
+                AudioEvent::EqEnabled { device_id, settings } => {
+                    self.eq_enabled_devices.insert(*device_id);
+                    self.eq_settings.insert(*device_id, settings.clone());
+                    let device_name = self.devices.iter()
+                        .find(|d| d.id == *device_id)
+                        .map(|d| d.name.as_str())
+                        .unwrap_or("device");
+                    self.status_message = format!("EQ enabled! In Helvum: Disconnect sources from '{}', connect them to wavewire_eq, then wavewire_eq to '{}'", device_name, device_name);
+                }
+                AudioEvent::EqDisabled { device_id } => {
+                    self.eq_enabled_devices.remove(device_id);
+                    self.eq_settings.remove(device_id);
+                    self.status_message = format!("EQ disabled for device {:?}", device_id);
+                }
+                AudioEvent::EqUpdated { device_id, settings } => {
+                    self.eq_settings.insert(*device_id, settings.clone());
+                    self.status_message = format!("EQ updated for device {:?}", device_id);
                 }
             }
         }
@@ -445,17 +627,132 @@ impl App {
             .title("Filters")
             .title_alignment(Alignment::Left);
 
-        let content = if self.devices.is_empty() {
-            "No devices available\n\nPress 'r' to refresh device list"
-        } else {
-            "Audio filters and processing\n\nConfigure DSP filters for this device"
-        };
+        if self.devices.is_empty() {
+            let paragraph = Paragraph::new("No devices available\n\nPress 'r' to refresh device list")
+                .block(block)
+                .alignment(Alignment::Center);
+            frame.render_widget(paragraph, area);
+            return;
+        }
 
-        let paragraph = Paragraph::new(content)
-            .block(block)
-            .alignment(Alignment::Center);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        frame.render_widget(paragraph, area);
+        // Show filter options
+        let device = &self.devices[self.selected_device];
+        let device_id = device.id;
+        let eq_enabled = self.eq_enabled_devices.contains(&device_id);
+
+        let filter_items: Vec<ListItem> = vec![
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    "[",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    if eq_enabled { "x" } else { " " },
+                    Style::default().fg(if eq_enabled { Color::Cyan } else { Color::DarkGray }),
+                ),
+                Span::styled(
+                    "]",
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    "Equalizer",
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(if self.focus_mode == FocusMode::FiltersTab {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                if eq_enabled {
+                    Span::styled(
+                        " (Press Space to adjust)",
+                        Style::default().fg(Color::DarkGray),
+                    )
+                } else {
+                    Span::styled(
+                        " (Press Space to enable)",
+                        Style::default().fg(Color::DarkGray),
+                    )
+                },
+            ])),
+        ];
+
+        let list = List::new(filter_items)
+            .highlight_style(
+                Style::default()
+                    .bg(if self.focus_mode == FocusMode::FiltersTab {
+                        Color::DarkGray
+                    } else {
+                        Color::Reset
+                    })
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(if self.focus_mode == FocusMode::FiltersTab { "> " } else { "  " });
+
+        frame.render_stateful_widget(
+            list,
+            inner,
+            &mut ratatui::widgets::ListState::default().with_selected(Some(self.selected_filter)),
+        );
+
+        // Show EQ settings if enabled
+        if eq_enabled && self.focus_mode == FocusMode::FiltersTab {
+            if let Some(settings) = self.eq_settings.get(&device_id) {
+                // Split the area to show EQ bands
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),  // Filter list
+                        Constraint::Min(0),     // EQ bands display
+                    ])
+                    .split(inner);
+
+                // Render EQ bands
+                let mut band_lines = vec![
+                    Line::from(Span::styled(
+                        "EQ Bands (Press Space to adjust in spectrum):",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                ];
+
+                const BANDS_HZ: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+                for (i, band) in settings.bands.iter().enumerate() {
+                    let freq_str = if BANDS_HZ[i] >= 1000 {
+                        format!("{}k", BANDS_HZ[i] / 1000)
+                    } else {
+                        format!("{}Hz", BANDS_HZ[i])
+                    };
+
+                    let gain_str = format!("{:+.1}dB", band.gain_db);
+                    band_lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{:>5}: ", freq_str),
+                            Style::default().fg(Color::Cyan),
+                        ),
+                        Span::styled(
+                            gain_str,
+                            Style::default().fg(if band.gain_db.abs() < 0.1 {
+                                Color::DarkGray
+                            } else if band.gain_db > 0.0 {
+                                Color::Green
+                            } else {
+                                Color::Red
+                            }),
+                        ),
+                    ]));
+                }
+
+                let paragraph = Paragraph::new(band_lines)
+                    .alignment(Alignment::Left);
+                frame.render_widget(paragraph, chunks[1]);
+            }
+        }
     }
 
     fn render_spectrum(&self, frame: &mut Frame, area: Rect, show_borders: bool) {
@@ -642,7 +939,7 @@ impl App {
                     let magnitude = get_magnitude(group_idx, device_id);
 
                     let normalized = (magnitude + 60.0_f32).max(0.0_f32).min(60.0_f32);
-                    let amplified = (normalized * 2.0_f32).min(60.0_f32);
+                    let amplified = (normalized * self.spectrum_amplification).min(60.0_f32);
                     let display_value = amplified as u64;
 
                     bars_data.push(("", display_value));
@@ -665,7 +962,16 @@ impl App {
 
         // We need to render bars with individual colors, but BarChart only has one style
         // Workaround: render the spectrum using custom rendering
-        self.render_custom_bars(frame, area, title, &bars_data, &bar_styles, show_borders);
+        self.render_custom_bars(
+            frame,
+            area,
+            title,
+            &bars_data,
+            &bar_styles,
+            show_borders,
+            num_frequency_groups,
+            bars_per_group,
+        );
     }
 
     fn render_custom_bars(
@@ -676,6 +982,8 @@ impl App {
         bars: &[(&str, u64)],
         bar_styles: &[Style],
         show_borders: bool,
+        num_frequency_groups: usize,
+        bars_per_group: usize,
     ) {
         let inner = if show_borders {
             let block = Block::default()
@@ -764,6 +1072,36 @@ impl App {
                 }
             }
         }
+
+        // Draw vertical lines for selected EQ band (if in EQ mode)
+        if self.focus_mode == FocusMode::SpectrumEq && self.devices.len() > self.selected_device {
+            let device = &self.devices[self.selected_device];
+            if self.eq_enabled_devices.contains(&device.id) {
+                // Calculate which frequency group corresponds to the selected EQ band
+                // We have 10 EQ bands mapped to num_frequency_groups
+                let band_group = (self.selected_eq_band * num_frequency_groups) / 10;
+
+                // Calculate the x position for this band
+                // Each group has bars_per_group bars
+                let base_x = band_group * bars_per_group;
+
+                // Draw vertical lines for the entire group
+                for offset in 0..bars_per_group {
+                    let x = inner.x + (base_x + offset) as u16;
+                    if x < inner.x + inner.width {
+                        // Draw vertical line from top to bottom
+                        for y in 0..inner.height {
+                            let cell_y = inner.y + y;
+                            if let Some(cell) = frame.buffer_mut().cell_mut((x, cell_y)) {
+                                // Use a distinct character for the selection line
+                                cell.set_symbol("│");
+                                cell.set_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Convert a 4-bit pattern to a braille character (both columns filled)
@@ -784,7 +1122,7 @@ impl App {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let status_text = vec![Line::from(vec![
+        let mut help_spans = vec![
             Span::styled(
                 "Status: ",
                 Style::default()
@@ -795,17 +1133,43 @@ impl App {
             Span::raw("  |  "),
             Span::styled("q", Style::default().fg(Color::Cyan)),
             Span::raw(": quit  "),
-            Span::styled("Tab", Style::default().fg(Color::Cyan)),
-            Span::raw(": switch tab  "),
-            Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
-            Span::raw(": select device  "),
-            Span::styled("r", Style::default().fg(Color::Cyan)),
-            Span::raw(": refresh  "),
-            Span::styled("Space", Style::default().fg(Color::Cyan)),
-            Span::raw(": toggle viz  "),
-            Span::styled("n", Style::default().fg(Color::Cyan)),
-            Span::raw(": new device"),
-        ])];
+        ];
+
+        // Add mode-specific help
+        match self.focus_mode {
+            FocusMode::DeviceList => {
+                help_spans.extend_from_slice(&[
+                    Span::styled("Tab", Style::default().fg(Color::Cyan)),
+                    Span::raw(": switch tab  "),
+                    Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
+                    Span::raw(": select  "),
+                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
+                    Span::raw(": filters  "),
+                    Span::styled("Space", Style::default().fg(Color::Cyan)),
+                    Span::raw(": viz"),
+                ]);
+            }
+            FocusMode::FiltersTab => {
+                help_spans.extend_from_slice(&[
+                    Span::styled("Esc/⌫", Style::default().fg(Color::Cyan)),
+                    Span::raw(": back  "),
+                    Span::styled("Space", Style::default().fg(Color::Cyan)),
+                    Span::raw(": toggle/adjust EQ"),
+                ]);
+            }
+            FocusMode::SpectrumEq => {
+                help_spans.extend_from_slice(&[
+                    Span::styled("Esc/⌫", Style::default().fg(Color::Cyan)),
+                    Span::raw(": back  "),
+                    Span::styled("k/l", Style::default().fg(Color::Cyan)),
+                    Span::raw(": band  "),
+                    Span::styled("h/j", Style::default().fg(Color::Cyan)),
+                    Span::raw(": gain"),
+                ]);
+            }
+        }
+
+        let status_text = vec![Line::from(help_spans)];
 
         let paragraph = Paragraph::new(status_text)
             .block(Block::default().borders(Borders::ALL))
@@ -835,6 +1199,11 @@ impl App {
     /// Get reference to visualized devices set
     pub fn get_visualized_devices(&self) -> &HashSet<DeviceId> {
         &self.visualized_devices
+    }
+
+    /// Get spectrum amplification factor
+    pub fn get_spectrum_amplification(&self) -> f32 {
+        self.spectrum_amplification
     }
 
     /// Find a device by name

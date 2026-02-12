@@ -10,8 +10,9 @@ use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 
 use super::device::VirtualDevice;
+use super::eq::EqSettings;
 use super::graph::{DeviceInfo, RoutingGraph};
-use super::stream::AudioCaptureStream;
+use super::stream::{AudioCaptureStream, AudioProcessingStream};
 use super::types::{
     AudioCommand, AudioEvent, DeviceId, DeviceType, PortDirection, PortId, PortInfo,
 };
@@ -22,6 +23,7 @@ thread_local! {
     static LINKS: RefCell<HashMap<u32, Link>> = RefCell::new(HashMap::new());
     static CONNECTION_TO_LINK: RefCell<HashMap<(PortId, PortId), u32>> = RefCell::new(HashMap::new());
     static CAPTURE_STREAMS: RefCell<HashMap<DeviceId, AudioCaptureStream>> = RefCell::new(HashMap::new());
+    static PROCESSING_STREAMS: RefCell<HashMap<DeviceId, AudioProcessingStream>> = RefCell::new(HashMap::new());
 }
 
 /// PipeWire client wrapper managing audio processing
@@ -248,6 +250,50 @@ impl PipeWireClient {
                         }
                         Ok(AudioCommand::StopVisualization { device_id }) => {
                             Self::handle_stop_visualization_command(
+                                &event_tx_cmd,
+                                device_id,
+                            );
+                        }
+                        Ok(AudioCommand::EnableEq { device_id, settings }) => {
+                            Self::handle_enable_eq_command(
+                                &routing_graph_cmd,
+                                &event_tx_cmd,
+                                device_id,
+                                settings,
+                            );
+                        }
+                        Ok(AudioCommand::DisableEq { device_id }) => {
+                            Self::handle_disable_eq_command(&event_tx_cmd, device_id);
+                        }
+                        Ok(AudioCommand::SetEqBand { device_id, band_index, gain_db, q_value }) => {
+                            Self::handle_set_eq_band_command(
+                                &routing_graph_cmd,
+                                &event_tx_cmd,
+                                device_id,
+                                band_index,
+                                gain_db,
+                                q_value,
+                            );
+                        }
+                        Ok(AudioCommand::SetEqSettings { device_id, settings }) => {
+                            Self::handle_set_eq_settings_command(
+                                &routing_graph_cmd,
+                                &event_tx_cmd,
+                                device_id,
+                                settings,
+                            );
+                        }
+                        Ok(AudioCommand::SetEqBypass { device_id, bypass }) => {
+                            Self::handle_set_eq_bypass_command(
+                                &routing_graph_cmd,
+                                &event_tx_cmd,
+                                device_id,
+                                bypass,
+                            );
+                        }
+                        Ok(AudioCommand::ResetEq { device_id }) => {
+                            Self::handle_reset_eq_command(
+                                &routing_graph_cmd,
                                 &event_tx_cmd,
                                 device_id,
                             );
@@ -880,6 +926,340 @@ impl PipeWireClient {
             } else {
                 let _ = event_tx.send(AudioEvent::Error {
                     message: format!("No visualization stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle enable EQ command - create an audio processing stream with EQ
+    fn handle_enable_eq_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+        settings: EqSettings,
+    ) {
+        crate::debug_log!("[EQ] Enable EQ for device {:?}", device_id);
+
+        // Get device info and its input ports from routing graph
+        let (device_name, device_input_ports) = {
+            let graph = routing_graph.read().unwrap();
+            match graph.get_device(device_id) {
+                Some(dev) => {
+                    // Find input ports (where audio goes INTO this device)
+                    let input_ports: Vec<_> = dev.ports.iter()
+                        .filter(|p| p.direction == PortDirection::Input)
+                        .cloned()
+                        .collect();
+
+                    crate::debug_log!("[EQ] Device '{}' has {} input ports", dev.name, input_ports.len());
+                    for port in &input_ports {
+                        crate::debug_log!("[EQ]   - {} ({})", port.name, port.pipewire_port_name);
+                    }
+
+                    (dev.name.clone(), input_ports)
+                }
+                None => {
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Device {:?} not found", device_id),
+                    });
+                    return;
+                }
+            }
+        };
+
+        // Find all connections going INTO the selected device's input ports
+        // These are the sources we want to redirect through the EQ
+        let connections_to_device = {
+            let graph = routing_graph.read().unwrap();
+            let mut connections = Vec::new();
+
+            for input_port in &device_input_ports {
+                // Find connections where this port is the destination
+                for conn in graph.list_connections() {
+                    if conn.destination == input_port.id {
+                        if let Some(source_port_name) = graph.find_port_name(conn.source) {
+                            connections.push((source_port_name.to_string(), input_port.pipewire_port_name.clone()));
+                            crate::debug_log!("[EQ] Found connection: {} → {}", source_port_name, input_port.pipewire_port_name);
+                        }
+                    }
+                }
+            }
+            connections
+        };
+
+        if connections_to_device.is_empty() {
+            crate::debug_log!("[EQ] WARNING: No active connections found going to device '{}'", device_name);
+            crate::debug_log!("[EQ] The EQ will be created but won't process audio until sources are connected");
+        }
+
+        // For stereo, try to find left and right pairs
+        // Look for the first two input ports as L/R
+        let dest_ports = if device_input_ports.len() >= 2 {
+            (
+                device_input_ports[0].pipewire_port_name.clone(),
+                device_input_ports[1].pipewire_port_name.clone(),
+            )
+        } else if device_input_ports.len() == 1 {
+            // Mono - use same port for both
+            (
+                device_input_ports[0].pipewire_port_name.clone(),
+                device_input_ports[0].pipewire_port_name.clone(),
+            )
+        } else {
+            let _ = event_tx.send(AudioEvent::Error {
+                message: format!("Device '{}' has no input ports", device_name),
+            });
+            return;
+        };
+
+        // For now, create EQ without auto-connecting (will be connected manually)
+        // Later we can implement automatic rerouting
+        let source_ports = ("".to_string(), "".to_string());
+
+        crate::debug_log!("[EQ] Creating EQ node to intercept audio going to '{}'", device_name);
+        crate::debug_log!("[EQ] Destination ports: {:?}", dest_ports);
+        crate::debug_log!("[EQ] Found {} source connections to reroute", connections_to_device.len());
+
+        // Create audio processing stream
+        match AudioProcessingStream::new(device_id, source_ports, dest_ports, settings.clone()) {
+            Ok(stream) => {
+                crate::debug_log!("[EQ] ✓ AudioProcessingStream created successfully for device {:?}", device_id);
+
+                // Store the stream in thread-local storage
+                PROCESSING_STREAMS.with(|streams| {
+                    streams.borrow_mut().insert(device_id, stream);
+                });
+
+                // Update routing graph with EQ settings
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.eq_settings = Some(settings.clone());
+                    }
+                }
+
+                // Send success event
+                let _ = event_tx.send(AudioEvent::EqEnabled {
+                    device_id,
+                    settings,
+                });
+            }
+            Err(e) => {
+                crate::debug_log!("[EQ] ✗ Failed to create processing stream: {}", e);
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("EQ FAILED: {} - Check debug.log for details", e),
+                });
+            }
+        }
+    }
+
+    /// Handle disable EQ command - destroy an audio processing stream
+    fn handle_disable_eq_command(event_tx: &Sender<AudioEvent>, device_id: DeviceId) {
+        crate::debug_log!("[EQ] Disable EQ for device {:?}", device_id);
+
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(_stream) = streams.borrow_mut().remove(&device_id) {
+                // Stream dropped, JACK will clean up
+                let _ = event_tx.send(AudioEvent::EqDisabled { device_id });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No EQ stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle set EQ band command - update a single band's parameters
+    fn handle_set_eq_band_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+        band_index: usize,
+        gain_db: f32,
+        q_value: f32,
+    ) {
+        crate::debug_log!("[EQ] Set band {} for device {:?}: gain={}dB, Q={}", band_index, device_id, gain_db, q_value);
+
+        if band_index >= 10 {
+            let _ = event_tx.send(AudioEvent::Error {
+                message: format!("Invalid band index: {}", band_index),
+            });
+            return;
+        }
+
+        // Get current settings from routing graph
+        let mut current_settings = {
+            let graph = routing_graph.read().unwrap();
+            match graph.get_device(device_id) {
+                Some(dev) => dev.eq_settings.clone().unwrap_or_default(),
+                None => {
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Device {:?} not found", device_id),
+                    });
+                    return;
+                }
+            }
+        };
+
+        // Update the specific band
+        current_settings.set_band(band_index, gain_db, q_value);
+
+        // Update the processing stream
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(stream) = streams.borrow().get(&device_id) {
+                stream.update_eq(current_settings.clone());
+
+                // Update routing graph
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.eq_settings = Some(current_settings.clone());
+                    }
+                }
+
+                // Send update event
+                let _ = event_tx.send(AudioEvent::EqUpdated {
+                    device_id,
+                    settings: current_settings,
+                });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No EQ stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle set EQ settings command - update all EQ settings at once
+    fn handle_set_eq_settings_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+        settings: EqSettings,
+    ) {
+        crate::debug_log!("[EQ] Set all EQ settings for device {:?}", device_id);
+
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(stream) = streams.borrow().get(&device_id) {
+                stream.update_eq(settings.clone());
+
+                // Update routing graph
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.eq_settings = Some(settings.clone());
+                    }
+                }
+
+                // Send update event
+                let _ = event_tx.send(AudioEvent::EqUpdated {
+                    device_id,
+                    settings,
+                });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No EQ stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle set EQ bypass command - toggle bypass mode
+    fn handle_set_eq_bypass_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+        bypass: bool,
+    ) {
+        crate::debug_log!("[EQ] Set bypass={} for device {:?}", bypass, device_id);
+
+        // Get current settings and update bypass flag
+        let mut current_settings = {
+            let graph = routing_graph.read().unwrap();
+            match graph.get_device(device_id) {
+                Some(dev) => dev.eq_settings.clone().unwrap_or_default(),
+                None => {
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Device {:?} not found", device_id),
+                    });
+                    return;
+                }
+            }
+        };
+
+        current_settings.bypass = bypass;
+
+        // Update the processing stream
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(stream) = streams.borrow().get(&device_id) {
+                stream.update_eq(current_settings.clone());
+
+                // Update routing graph
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.eq_settings = Some(current_settings.clone());
+                    }
+                }
+
+                // Send update event
+                let _ = event_tx.send(AudioEvent::EqUpdated {
+                    device_id,
+                    settings: current_settings,
+                });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No EQ stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle reset EQ command - reset all bands to 0 dB gain
+    fn handle_reset_eq_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+    ) {
+        crate::debug_log!("[EQ] Reset EQ for device {:?}", device_id);
+
+        // Get current settings and reset
+        let mut current_settings = {
+            let graph = routing_graph.read().unwrap();
+            match graph.get_device(device_id) {
+                Some(dev) => dev.eq_settings.clone().unwrap_or_default(),
+                None => {
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Device {:?} not found", device_id),
+                    });
+                    return;
+                }
+            }
+        };
+
+        current_settings.reset();
+
+        // Update the processing stream
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(stream) = streams.borrow().get(&device_id) {
+                stream.update_eq(current_settings.clone());
+
+                // Update routing graph
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.eq_settings = Some(current_settings.clone());
+                    }
+                }
+
+                // Send update event
+                let _ = event_tx.send(AudioEvent::EqUpdated {
+                    device_id,
+                    settings: current_settings,
+                });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No EQ stream found for device {:?}", device_id),
                 });
             }
         });

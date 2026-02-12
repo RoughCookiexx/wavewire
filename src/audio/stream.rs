@@ -1,10 +1,11 @@
 use anyhow::Result;
 use crossbeam_channel::Sender;
-use jack::{AudioIn, Client, Port};
+use jack::{AudioIn, AudioOut, Client, Port};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use super::eq::EqProcessor;
 use super::fft::FftProcessor;
 use super::types::{AudioEvent, DeviceId, PortId, SpectrumData};
 
@@ -404,6 +405,227 @@ impl Drop for AudioCaptureStream {
     fn drop(&mut self) {
         crate::debug_log!(
             "[JACK] Dropping audio capture stream for device {:?}",
+            self.device_id
+        );
+        // JACK client will be automatically deactivated and cleaned up
+    }
+}
+
+/// JACK processor for real-time EQ with bidirectional audio
+struct JackEqProcessor {
+    /// Left channel input port
+    in_left: Port<AudioIn>,
+    /// Right channel input port
+    in_right: Port<AudioIn>,
+    /// Left channel output port
+    out_left: Port<AudioOut>,
+    /// Right channel output port
+    out_right: Port<AudioOut>,
+    /// EQ processor
+    eq_processor: EqProcessor,
+}
+
+impl jack::ProcessHandler for JackEqProcessor {
+    fn process(&mut self, _client: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
+        // Get input audio slices
+        let in_left = self.in_left.as_slice(ps);
+        let in_right = self.in_right.as_slice(ps);
+
+        // Get output audio slices (mutable)
+        let out_left = self.out_left.as_mut_slice(ps);
+        let out_right = self.out_right.as_mut_slice(ps);
+
+        // Process each sample through EQ
+        for i in 0..in_left.len() {
+            let (l, r) = self.eq_processor.process_sample(in_left[i], in_right[i]);
+            out_left[i] = l;
+            out_right[i] = r;
+        }
+
+        jack::Control::Continue
+    }
+}
+
+/// Audio processing stream for real-time EQ
+/// Creates a JACK client with input and output ports, processing audio through an EQ
+pub struct AudioProcessingStream {
+    /// Device ID this stream is processing
+    device_id: DeviceId,
+    /// Sample rate of the stream
+    sample_rate: u32,
+    /// JACK client (must be kept alive)
+    _jack_client: jack::AsyncClient<(), JackEqProcessor>,
+    /// Update flag for EQ settings (shared with processor)
+    update_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Pending settings for EQ (shared with processor)
+    pending_settings: Arc<Mutex<Option<super::eq::EqSettings>>>,
+}
+
+impl AudioProcessingStream {
+    /// Create a new audio processing stream with EQ
+    pub fn new(
+        device_id: DeviceId,
+        source_ports: (String, String),  // (left, right) ports to read from
+        dest_ports: (String, String),    // (left, right) ports to write to
+        eq_settings: super::eq::EqSettings,
+    ) -> Result<Self> {
+        let client_name = format!("wavewire_eq_{}", device_id.0);
+
+        crate::debug_log!(
+            "[JACK EQ] Creating processing stream for device {:?}",
+            device_id
+        );
+        crate::debug_log!("[JACK EQ] Source ports: {:?}", source_ports);
+        crate::debug_log!("[JACK EQ] Dest ports: {:?}", dest_ports);
+
+        // Create JACK client
+        let (client, _status) =
+            jack::Client::new(&client_name, jack::ClientOptions::NO_START_SERVER)?;
+
+        let sample_rate = client.sample_rate();
+        crate::debug_log!(
+            "[JACK EQ] Client created: {}, sample_rate={}Hz",
+            client_name,
+            sample_rate
+        );
+
+        // Register ports (2 inputs, 2 outputs)
+        let in_left = client.register_port("in_L", jack::AudioIn::default())?;
+        let in_right = client.register_port("in_R", jack::AudioIn::default())?;
+        let out_left = client.register_port("out_L", jack::AudioOut::default())?;
+        let out_right = client.register_port("out_R", jack::AudioOut::default())?;
+        crate::debug_log!("[JACK EQ] Registered 4 ports (2 in, 2 out)");
+
+        // Create EQ processor
+        let eq_processor = EqProcessor::new(sample_rate as f32, eq_settings);
+        let (update_flag, pending_settings) = eq_processor.get_update_handles();
+
+        let processor = JackEqProcessor {
+            in_left,
+            in_right,
+            out_left,
+            out_right,
+            eq_processor,
+        };
+
+        // Activate client
+        let async_client = client.activate_async((), processor)?;
+        crate::debug_log!("[JACK EQ] Client activated");
+
+        // Get client reference for port operations
+        let client_ref = async_client.as_client();
+
+        // List all available ports for debugging
+        let all_ports = client_ref.ports(None, None, jack::PortFlags::empty());
+        crate::debug_log!("[JACK EQ] === Available JACK Ports ===");
+        for port in &all_ports {
+            crate::debug_log!("[JACK EQ]   {}", port);
+        }
+        crate::debug_log!("[JACK EQ] === EQ Client Created ===");
+        crate::debug_log!("[JACK EQ] Client name: {}", client_name);
+        crate::debug_log!("[JACK EQ] Input ports:  {}:in_L, {}:in_R", client_name, client_name);
+        crate::debug_log!("[JACK EQ] Output ports: {}:out_L, {}:out_R", client_name, client_name);
+        crate::debug_log!("[JACK EQ]");
+        crate::debug_log!("[JACK EQ] ⚠ MANUAL CONNECTION REQUIRED:");
+        crate::debug_log!("[JACK EQ] 1. In Helvum/qpwgraph:");
+        crate::debug_log!("[JACK EQ]    a) Disconnect sources from: {} and {}", dest_ports.0, dest_ports.1);
+        crate::debug_log!("[JACK EQ]    b) Connect those sources → {}:in_L and {}:in_R", client_name, client_name);
+        crate::debug_log!("[JACK EQ]    c) Connect {}:out_L → {}", client_name, dest_ports.0);
+        crate::debug_log!("[JACK EQ]    d) Connect {}:out_R → {}", client_name, dest_ports.1);
+
+        // Skip automatic connections for now - let user connect manually
+        // This avoids errors from non-existent ports
+        /*
+        let mut connection_errors = Vec::new();
+
+        // Connect inputs (source → our input ports)
+        match client_ref.connect_ports_by_name(
+            &source_ports.0,
+            &format!("{}:in_L", client_name),
+        ) {
+            Ok(_) => crate::debug_log!("[JACK EQ] ✓ Connected input left: {} → {}:in_L", source_ports.0, client_name),
+            Err(e) => {
+                let msg = format!("Failed to connect input left ({}): {}", source_ports.0, e);
+                crate::debug_log!("[JACK EQ] ✗ {}", msg);
+                connection_errors.push(msg);
+            }
+        }
+
+        match client_ref.connect_ports_by_name(
+            &source_ports.1,
+            &format!("{}:in_R", client_name),
+        ) {
+            Ok(_) => crate::debug_log!("[JACK EQ] ✓ Connected input right: {} → {}:in_R", source_ports.1, client_name),
+            Err(e) => {
+                let msg = format!("Failed to connect input right ({}): {}", source_ports.1, e);
+                crate::debug_log!("[JACK EQ] ✗ {}", msg);
+                connection_errors.push(msg);
+            }
+        }
+
+        // Connect outputs (our output ports → destination)
+        match client_ref.connect_ports_by_name(
+            &format!("{}:out_L", client_name),
+            &dest_ports.0,
+        ) {
+            Ok(_) => crate::debug_log!("[JACK EQ] ✓ Connected output left: {}:out_L → {}", client_name, dest_ports.0),
+            Err(e) => {
+                let msg = format!("Failed to connect output left ({}): {}", dest_ports.0, e);
+                crate::debug_log!("[JACK EQ] ✗ {}", msg);
+                connection_errors.push(msg);
+            }
+        }
+
+        match client_ref.connect_ports_by_name(
+            &format!("{}:out_R", client_name),
+            &dest_ports.1,
+        ) {
+            Ok(_) => crate::debug_log!("[JACK EQ] ✓ Connected output right: {}:out_R → {}", client_name, dest_ports.1),
+            Err(e) => {
+                let msg = format!("Failed to connect output right ({}): {}", dest_ports.1, e);
+                crate::debug_log!("[JACK EQ] ✗ {}", msg);
+                connection_errors.push(msg);
+            }
+        }
+
+        // Return error if any connections failed
+        if !connection_errors.is_empty() {
+            return Err(anyhow::anyhow!(
+                "EQ port connection errors:\n{}",
+                connection_errors.join("\n")
+            ));
+        }
+        */
+
+        Ok(Self {
+            device_id,
+            sample_rate: sample_rate as u32,
+            _jack_client: async_client,
+            update_flag,
+            pending_settings,
+        })
+    }
+
+    /// Update EQ settings from another thread (non-blocking)
+    pub fn update_eq(&self, new_settings: super::eq::EqSettings) {
+        super::eq::update_eq_settings(&self.update_flag, &self.pending_settings, new_settings);
+    }
+
+    /// Get the device ID for this stream
+    pub fn device_id(&self) -> DeviceId {
+        self.device_id
+    }
+
+    /// Get the sample rate of this stream
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+}
+
+impl Drop for AudioProcessingStream {
+    fn drop(&mut self) {
+        crate::debug_log!(
+            "[JACK EQ] Dropping audio processing stream for device {:?}",
             self.device_id
         );
         // JACK client will be automatically deactivated and cleaned up

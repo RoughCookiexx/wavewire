@@ -1,6 +1,8 @@
 use std::fmt;
 use std::time::Instant;
 
+use super::eq::EqSettings;
+
 /// Unique identifier for an audio device
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DeviceId(pub u64);
@@ -123,6 +125,36 @@ pub enum AudioCommand {
     StopVisualization {
         device_id: DeviceId,
     },
+    /// Enable EQ for a device
+    EnableEq {
+        device_id: DeviceId,
+        settings: EqSettings,
+    },
+    /// Disable EQ for a device
+    DisableEq {
+        device_id: DeviceId,
+    },
+    /// Update a single EQ band
+    SetEqBand {
+        device_id: DeviceId,
+        band_index: usize,
+        gain_db: f32,
+        q_value: f32,
+    },
+    /// Update all EQ bands at once
+    SetEqSettings {
+        device_id: DeviceId,
+        settings: EqSettings,
+    },
+    /// Toggle EQ bypass
+    SetEqBypass {
+        device_id: DeviceId,
+        bypass: bool,
+    },
+    /// Reset EQ to flat (all gains = 0 dB)
+    ResetEq {
+        device_id: DeviceId,
+    },
 }
 
 /// Events sent from audio thread to UI thread
@@ -163,6 +195,20 @@ pub enum AudioEvent {
     SpectrumUpdate {
         device_id: DeviceId,
         data: SpectrumData,
+    },
+    /// EQ was enabled for a device
+    EqEnabled {
+        device_id: DeviceId,
+        settings: EqSettings,
+    },
+    /// EQ was disabled for a device
+    EqDisabled {
+        device_id: DeviceId,
+    },
+    /// EQ settings were updated
+    EqUpdated {
+        device_id: DeviceId,
+        settings: EqSettings,
     },
 }
 

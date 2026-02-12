@@ -1,10 +1,12 @@
 mod client;
 mod device;
+mod eq;
 mod fft;
 mod graph;
 mod stream;
 mod types;
 
+pub use eq::{EqBandParams, EqSettings, GRAPHIC_EQ_BANDS};
 pub use graph::DeviceInfo;
 pub use types::{AudioCommand, AudioEvent, DeviceId, DeviceType, PortDirection, PortId, PortInfo, SpectrumData};
 

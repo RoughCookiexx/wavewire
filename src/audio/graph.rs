@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use super::eq::EqSettings;
 use super::types::{DeviceId, DeviceType, PortId, PortInfo};
 
 /// Information about an audio device
@@ -9,6 +10,7 @@ pub struct DeviceInfo {
     pub name: String,
     pub device_type: DeviceType,
     pub ports: Vec<PortInfo>,
+    pub eq_settings: Option<EqSettings>,
 }
 
 impl DeviceInfo {
@@ -18,6 +20,7 @@ impl DeviceInfo {
             name,
             device_type,
             ports: Vec::new(),
+            eq_settings: None,
         }
     }
 }
