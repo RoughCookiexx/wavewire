@@ -11,6 +11,7 @@ use termion::event::Key;
 use crate::audio::{AudioEngine, AudioEvent, DeviceInfo};
 use crate::audio::{DeviceId, SpectrumData};
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// Minimum terminal height for full layout (with device list and tabs)
 /// Below this threshold, only spectrum is displayed
@@ -65,6 +66,10 @@ pub struct App {
     visualized_devices: HashSet<DeviceId>,
     /// Latest spectrum data per device
     spectrum_data: HashMap<DeviceId, SpectrumData>,
+    /// Timestamp of last visualization change (for debouncing)
+    last_viz_change: Option<Instant>,
+    /// Dirty flag indicating unsaved changes
+    config_dirty: bool,
 }
 
 impl App {
@@ -77,6 +82,8 @@ impl App {
             status_message: String::from("Starting up..."),
             visualized_devices: HashSet::new(),
             spectrum_data: HashMap::new(),
+            last_viz_change: None,
+            config_dirty: false,
         }
     }
 
@@ -179,6 +186,8 @@ impl App {
                 }
                 AudioEvent::VisualizationStarted { device_id, port_id } => {
                     self.visualized_devices.insert(*device_id);
+                    self.last_viz_change = Some(Instant::now());
+                    self.config_dirty = true;
                     self.status_message = format!(
                         "Visualization started for device {:?}, port {:?}",
                         device_id, port_id
@@ -187,6 +196,8 @@ impl App {
                 AudioEvent::VisualizationStopped { device_id } => {
                     self.visualized_devices.remove(device_id);
                     self.spectrum_data.remove(device_id);
+                    self.last_viz_change = Some(Instant::now());
+                    self.config_dirty = true;
                     self.status_message =
                         format!("Visualization stopped for device {:?}", device_id);
                 }
@@ -801,5 +812,33 @@ impl App {
             .alignment(Alignment::Left);
 
         frame.render_widget(paragraph, area);
+    }
+
+    /// Check if auto-save should be triggered (debounced after 2 seconds)
+    pub fn should_auto_save(&self) -> bool {
+        if !self.config_dirty {
+            return false;
+        }
+
+        if let Some(last_change) = self.last_viz_change {
+            last_change.elapsed() >= Duration::from_secs(2)
+        } else {
+            false
+        }
+    }
+
+    /// Mark config as saved (clear dirty flag)
+    pub fn mark_config_saved(&mut self) {
+        self.config_dirty = false;
+    }
+
+    /// Get reference to visualized devices set
+    pub fn get_visualized_devices(&self) -> &HashSet<DeviceId> {
+        &self.visualized_devices
+    }
+
+    /// Find a device by name
+    pub fn find_device_by_name(&self, name: &str) -> Option<&DeviceInfo> {
+        self.devices.iter().find(|d| d.name == name)
     }
 }

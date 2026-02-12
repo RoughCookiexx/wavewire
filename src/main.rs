@@ -9,9 +9,11 @@ use termion::{async_stdin, event::Key, input::TermRead, raw::IntoRawMode};
 mod audio;
 mod ui;
 mod debug_log;
+mod config;
 
 use audio::{AudioEngine, AudioEvent};
 use ui::App;
+use config::{Config, ConfigManager};
 
 /// Target frames per second for the UI
 const TARGET_FPS: u64 = 60;
@@ -51,11 +53,21 @@ fn run_app() -> Result<()> {
     // Initialize UI app
     let mut app = App::new();
 
+    // Load configuration
+    let config_manager = ConfigManager::new()?;
+    let config = config_manager.load().unwrap_or_else(|e| {
+        debug_log!("Failed to load config: {}, using defaults", e);
+        Config::default()
+    });
+
     // Set up non-blocking input handling
     let input_rx = spawn_input_thread();
 
     // Track frame timing
     let mut last_frame = Instant::now();
+
+    // Track first iteration for config restoration
+    let mut first_iteration = true;
 
     // Main application loop
     while app.running {
@@ -72,6 +84,26 @@ fn run_app() -> Result<()> {
         // Refresh device list if device events occurred
         if has_device_events {
             let _ = app.refresh_devices(&audio_engine);
+
+            // Restore visualizations from config on first device discovery
+            if first_iteration {
+                for device_name in &config.visualization.enabled_devices {
+                    if let Some(device) = app.find_device_by_name(device_name) {
+                        if let Some(port) = device.ports.iter().find(|p| {
+                            use crate::audio::PortDirection;
+                            p.direction == PortDirection::Output
+                        }) {
+                            use crate::audio::AudioCommand;
+                            let _ = audio_engine.send_command(AudioCommand::StartVisualization {
+                                device_id: device.id,
+                                port_id: port.id,
+                            });
+                            debug_log!("Restored visualization for: {}", device_name);
+                        }
+                    }
+                }
+                first_iteration = false;
+            }
         }
 
         // Handle keyboard input
@@ -89,6 +121,18 @@ fn run_app() -> Result<()> {
             }
         }
 
+        // Auto-save config if needed (debounced)
+        if app.should_auto_save() {
+            let devices = audio_engine.list_devices().unwrap_or_default();
+            let config = Config::from_visualized_devices(&app.get_visualized_devices(), &devices);
+            if let Err(e) = config_manager.save(&config) {
+                debug_log!("Auto-save failed: {}", e);
+            } else {
+                app.mark_config_saved();
+                debug_log!("Config auto-saved");
+            }
+        }
+
         // Render UI if enough time has passed
         if elapsed >= FRAME_DURATION {
             terminal.draw(|frame| {
@@ -102,6 +146,15 @@ fn run_app() -> Result<()> {
                 thread::sleep(sleep_time);
             }
         }
+    }
+
+    // Save configuration before cleanup
+    let devices = audio_engine.list_devices().unwrap_or_default();
+    let final_config = Config::from_visualized_devices(&app.get_visualized_devices(), &devices);
+    if let Err(e) = config_manager.save(&final_config) {
+        debug_log!("Failed to save config on exit: {}", e);
+    } else {
+        debug_log!("Config saved on exit");
     }
 
     // Cleanup - restore terminal to normal mode
