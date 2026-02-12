@@ -1,1 +1,29 @@
-/target
+# Rust build artifacts
+/target/
+
+# Debug logs
+*.log
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# IDE/Editor files
+.vscode/
+.idea/
+*.iml
+.fleet/
+
+# Testing artifacts
+*.profraw
+*.profdata
+
+# Rust-specific
+**/*.rs.bk
+*.pdb
