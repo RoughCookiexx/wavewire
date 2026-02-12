@@ -14,10 +14,10 @@ use std::collections::{HashMap, HashSet};
 
 /// Minimum terminal height for full layout (with device list and tabs)
 /// Below this threshold, only spectrum is displayed
-const MIN_HEIGHT_FOR_FULL_LAYOUT: u16 = 60;
+const MIN_HEIGHT_FOR_FULL_LAYOUT: u16 = 24;
 
 /// Height reserved for the spectrum visualization in full layout
-const SPECTRUM_HEIGHT: u16 = 32;
+const SPECTRUM_HEIGHT: u16 = 24;
 
 /// Width of the left navigation panel (device list)
 const DEVICE_LIST_WIDTH: u16 = 30;
@@ -266,7 +266,7 @@ impl App {
 
     fn render_minimal_layout(&self, frame: &mut Frame) {
         // In minimal mode, just show spectrum filling the entire screen
-        self.render_spectrum(frame, frame.area());
+        self.render_spectrum(frame, frame.area(), false);
     }
 
     fn render_full_layout(&mut self, frame: &mut Frame) {
@@ -296,7 +296,7 @@ impl App {
         self.render_main_content(frame, content_chunks[1]);
 
         // Render spectrum at the bottom
-        self.render_spectrum(frame, main_chunks[1]);
+        self.render_spectrum(frame, main_chunks[1], true);
 
         // Render status bar at the very bottom
         self.render_status_bar(frame, main_chunks[2]);
@@ -447,21 +447,31 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
-    fn render_spectrum(&self, frame: &mut Frame, area: Rect) {
+    fn render_spectrum(&self, frame: &mut Frame, area: Rect, show_borders: bool) {
         // If no devices are being visualized, show a message
         if self.visualized_devices.is_empty() {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title("Frequency Spectrum - Combined View")
-                .title_alignment(Alignment::Left);
+            if show_borders {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Frequency Spectrum - Combined View")
+                    .title_alignment(Alignment::Left);
 
-            let paragraph = Paragraph::new(
-                "No devices visualized\n\nPress Space on a device to start visualization",
-            )
-            .block(block)
-            .alignment(Alignment::Center);
+                let paragraph = Paragraph::new(
+                    "No devices visualized\n\nPress Space on a device to start visualization",
+                )
+                .block(block)
+                .alignment(Alignment::Center);
 
-            frame.render_widget(paragraph, area);
+                frame.render_widget(paragraph, area);
+            } else {
+                // In minimal mode, just show a simple message without borders
+                let paragraph = Paragraph::new(
+                    "No devices visualized\n\nPress Space on a device to start visualization",
+                )
+                .alignment(Alignment::Center);
+
+                frame.render_widget(paragraph, area);
+            }
             return;
         }
 
@@ -474,12 +484,14 @@ impl App {
             .iter()
             .any(|id| self.spectrum_data.contains_key(id));
         if !has_data {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .title("Frequency Spectrum - Waiting for data...")
-                .title_alignment(Alignment::Left);
+            if show_borders {
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .title("Frequency Spectrum - Waiting for data...")
+                    .title_alignment(Alignment::Left);
 
-            frame.render_widget(block, area);
+                frame.render_widget(block, area);
+            }
             return;
         }
 
@@ -502,7 +514,7 @@ impl App {
         let title = format!("Frequency Spectrum - {}", device_info.join(" | "));
 
         // Render the combined spectrum
-        self.render_combined_spectrum(frame, area, &title, &device_ids);
+        self.render_combined_spectrum(frame, area, &title, &device_ids, show_borders);
     }
 
     fn get_device_color(idx: usize) -> Color {
@@ -535,6 +547,7 @@ impl App {
         area: Rect,
         title: &str,
         device_ids: &[DeviceId],
+        show_borders: bool,
     ) {
         let num_devices = device_ids.len();
 
@@ -544,73 +557,104 @@ impl App {
             .find_map(|id| self.spectrum_data.get(id))
             .unwrap();
 
-        let num_frequency_bins = first_spectrum.bins.len();
+        let total_bins = first_spectrum.bins.len();
 
-        // Calculate how many frequency bins we can show given terminal width
-        // Each frequency bin needs num_devices bars + 1 space between groups
-        let available_width = area.width.saturating_sub(4) as usize; // Account for borders
+        // Calculate the actual inner width the same way render_custom_bars does
+        let available_width = if show_borders {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_alignment(Alignment::Left);
+            block.inner(area).width as usize
+        } else {
+            area.width as usize
+        };
+
+        if available_width == 0 {
+            return;
+        }
+
         let bars_per_group = num_devices;
-        let space_per_group = 1;
-        let total_per_group = bars_per_group + space_per_group;
 
-        let num_groups = (available_width / total_per_group)
-            .max(1)
-            .min(num_frequency_bins);
+        // Calculate how many frequency groups we can show and how many times to repeat each
+        let max_possible_groups = available_width / bars_per_group;
+        let num_frequency_groups = max_possible_groups.min(total_bins);
 
-        // Build bar chart data: for each frequency bin, add bars for all devices
+        if num_frequency_groups == 0 {
+            return;
+        }
+
+        // Calculate base repetition per group and extra bars
+        let base_repetition = available_width / (num_frequency_groups * bars_per_group);
+        let total_with_base = num_frequency_groups * bars_per_group * base_repetition;
+        let extra_bars = available_width - total_with_base;
+
+        // Build bar chart data
         let mut bars_data: Vec<(&str, u64)> = Vec::new();
         let mut bar_styles: Vec<Style> = Vec::new();
 
-        for group_idx in 0..num_groups {
-            // Map to actual bin index (downsample if needed)
-            let bin_idx = (group_idx * num_frequency_bins) / num_groups;
+        // Helper function to get magnitude for a frequency range
+        let get_magnitude = |group_idx: usize, device_id: DeviceId| -> f32 {
+            let bin_start = (group_idx * total_bins) / num_frequency_groups;
+            let bin_end = ((group_idx + 1) * total_bins) / num_frequency_groups;
 
-            // Add bars for each device in this frequency bin
-            for (device_idx, &device_id) in device_ids.iter().enumerate() {
-                let magnitude = if let Some(spectrum) = self.spectrum_data.get(&device_id) {
+            if let Some(spectrum) = self.spectrum_data.get(&device_id) {
+                let mut max_mag: f32 = -60.0;
+                for bin_idx in bin_start..bin_end {
                     if bin_idx < spectrum.bins.len() {
-                        spectrum.bins[bin_idx]
-                    } else {
-                        -60.0
+                        max_mag = max_mag.max(spectrum.bins[bin_idx]);
                     }
-                } else {
-                    -60.0
-                };
-
-                // Diagnostic logging (log occasionally)
-                if device_idx == 0 && bin_idx % 16 == 0 {
-                    crate::debug_log!(
-                        "[RENDER] Device {:?}, bin {}: magnitude={:.2} dB",
-                        device_id,
-                        bin_idx,
-                        magnitude
-                    );
                 }
-
-                // Convert dB to display value with amplification
-                // Original range: -60 to 0 dB
-                // Amplify by 3x to make quiet signals more visible
-                // Apply baseline offset so there's always something visible
-                let normalized = (magnitude + 60.0).max(0.0).min(60.0); // 0-60 range
-                let amplified = (normalized * 3.0).min(60.0); // Amplify by 3x, cap at 60
-                let with_baseline = amplified + 5.0; // Add 5-point baseline so bars are always visible
-                let display_value = with_baseline as u64;
-
-                // Add bar
-                bars_data.push(("", display_value));
-                bar_styles.push(Style::default().fg(Self::get_device_color(device_idx)));
+                max_mag
+            } else {
+                -60.0
             }
+        };
 
-            // Add a gap/spacer between frequency groups (except last)
-            if group_idx < num_groups - 1 {
-                bars_data.push(("", 0));
-                bar_styles.push(Style::default().fg(Color::DarkGray));
+        // Track extra bars distributed
+        let mut extra_bars_used = 0;
+
+        // For each frequency group
+        for group_idx in 0..num_frequency_groups {
+            // Calculate repetitions for this group (distribute extra bars evenly)
+            let extra_for_this_group = if extra_bars_used < extra_bars {
+                extra_bars_used += 1;
+                1
+            } else {
+                0
+            };
+            let repetitions_for_this_group = base_repetition + extra_for_this_group;
+
+            // Repeat this frequency group's bars the calculated number of times
+            for _rep in 0..repetitions_for_this_group {
+                for (device_idx, &device_id) in device_ids.iter().enumerate() {
+                    let magnitude = get_magnitude(group_idx, device_id);
+
+                    let normalized = (magnitude + 60.0_f32).max(0.0_f32).min(60.0_f32);
+                    let amplified = (normalized * 2.0_f32).min(60.0_f32);
+                    let display_value = amplified as u64;
+
+                    bars_data.push(("", display_value));
+                    bar_styles.push(Style::default().fg(Self::get_device_color(device_idx)));
+                }
             }
         }
 
+        // Debug logging
+        crate::debug_log!(
+            "[SPECTRUM] area.width={}, available_width={}, bars_per_group={}, num_frequency_groups={}, base_rep={}, extra_bars={}, total_bars={}",
+            area.width,
+            available_width,
+            bars_per_group,
+            num_frequency_groups,
+            base_repetition,
+            extra_bars,
+            bars_data.len()
+        );
+
         // We need to render bars with individual colors, but BarChart only has one style
         // Workaround: render the spectrum using custom rendering
-        self.render_custom_bars(frame, area, title, &bars_data, &bar_styles);
+        self.render_custom_bars(frame, area, title, &bars_data, &bar_styles, show_borders);
     }
 
     fn render_custom_bars(
@@ -620,22 +664,37 @@ impl App {
         title: &str,
         bars: &[(&str, u64)],
         bar_styles: &[Style],
+        show_borders: bool,
     ) {
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_alignment(Alignment::Left);
+        let inner = if show_borders {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .title_alignment(Alignment::Left);
 
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            inner
+        } else {
+            // In minimal mode, use the full area without borders
+            area
+        };
+
+        crate::debug_log!(
+            "[RENDER_BARS] area.width={}, inner.width={}, bars.len()={}, show_borders={}",
+            area.width,
+            inner.width,
+            bars.len(),
+            show_borders
+        );
 
         if bars.is_empty() || inner.width < 2 || inner.height < 3 {
             return;
         }
 
-        // Reserve bottom line for frequency labels
-        let bar_height_area = inner.height.saturating_sub(1);
-        let label_y = inner.y + bar_height_area;
+        // Use full height for bars
+        let bar_height_area = inner.height;
+        let _label_y = inner.y + bar_height_area;
 
         // Max height accounts for baseline (5) + amplified range (60)
         let max_height = 65.0; // Baseline (5) + max amplified dB (60)
@@ -651,7 +710,8 @@ impl App {
             }
 
             // Calculate height in braille pixels (4x resolution)
-            let bar_height_pixels = (*value as f32 / max_height * total_vertical_pixels as f32) as usize;
+            let bar_height_pixels =
+                (*value as f32 / max_height * total_vertical_pixels as f32) as usize;
             let bar_height_pixels = bar_height_pixels.min(total_vertical_pixels).max(1);
 
             if bar_height_pixels > 0 {
@@ -693,9 +753,6 @@ impl App {
                 }
             }
         }
-
-        // Render frequency labels at the bottom
-        self.render_frequency_labels(frame, inner, label_y);
     }
 
     /// Convert a 4-bit pattern to a braille character (both columns filled)
@@ -711,41 +768,7 @@ impl App {
             0b0011 => "⣤", // bottom 2 rows (dots 3,6,7,8)
             0b0111 => "⣶", // bottom 3 rows (dots 2,3,5,6,7,8)
             0b1111 => "⣿", // all 4 rows (full block)
-            _ => "⠀", // default to blank for other patterns
-        }
-    }
-
-    fn render_frequency_labels(&self, frame: &mut Frame, inner: Rect, y: u16) {
-        // Frequency markers: 20Hz, 100Hz, 1kHz, 10kHz, 20kHz
-        let labels = ["20Hz", "100Hz", "1kHz", "10kHz", "20kHz"];
-        let width = inner.width as usize;
-
-        if width < 30 {
-            // Too narrow for labels
-            return;
-        }
-
-        // Calculate positions (logarithmic scale)
-        // Assuming frequency range 20Hz - 20kHz
-        let positions = [0.0, 0.25, 0.5, 0.75, 1.0]; // Approximate log positions
-
-        for (label, &pos) in labels.iter().zip(positions.iter()) {
-            let x_offset = (pos * width as f32) as u16;
-            let x = inner.x + x_offset;
-
-            // Make sure label fits
-            if x + label.len() as u16 <= inner.x + inner.width {
-                let label_area = Rect {
-                    x,
-                    y,
-                    width: label.len() as u16,
-                    height: 1,
-                };
-
-                let text = Paragraph::new(*label).style(Style::default().fg(Color::DarkGray));
-
-                frame.render_widget(text, label_area);
-            }
+            _ => "⠀",      // default to blank for other patterns
         }
     }
 
