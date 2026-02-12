@@ -10,7 +10,7 @@ mod audio;
 mod ui;
 mod debug_log;
 
-use audio::AudioEngine;
+use audio::{AudioEngine, AudioEvent};
 use ui::App;
 
 /// Target frames per second for the UI
@@ -64,7 +64,15 @@ fn run_app() -> Result<()> {
 
         // Poll audio events and update app state
         let audio_events = audio_engine.poll_events();
+        let has_device_events = audio_events.iter().any(|e| {
+            matches!(e, AudioEvent::DeviceAdded { .. } | AudioEvent::DeviceRemoved { .. })
+        });
         app.handle_audio_events(&audio_events);
+
+        // Refresh device list if device events occurred
+        if has_device_events {
+            let _ = app.refresh_devices(&audio_engine);
+        }
 
         // Handle keyboard input
         loop {

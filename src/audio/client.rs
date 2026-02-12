@@ -321,14 +321,26 @@ impl PipeWireClient {
         // Store objects in thread-local storage so they stay alive for the duration
         // of the registry listener
         use std::any::Any;
+        use std::collections::HashSet;
         thread_local! {
             static NODES: RefCell<Vec<Node>> = RefCell::new(Vec::new());
             static PORTS: RefCell<Vec<Port>> = RefCell::new(Vec::new());
             static LISTENERS: RefCell<Vec<Box<dyn Any>>> = RefCell::new(Vec::new());
+            static PROCESSED_NODES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+            static PROCESSED_PORTS: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
         }
 
         match obj.type_ {
             ObjectType::Node => {
+                // Check if we've already processed this node
+                let already_processed = PROCESSED_NODES.with(|set| {
+                    set.borrow().contains(&obj.id)
+                });
+
+                if already_processed {
+                    return; // Skip already processed nodes
+                }
+
                 // Bind the node proxy
                 let node: Node = match registry.bind(obj) {
                     Ok(node) => node,
@@ -359,38 +371,65 @@ impl PipeWireClient {
                             return;
                         }
 
-                        // Create device info
-                        let device_id = {
-                            let mut graph = routing_graph.write().unwrap();
-                            let device_id = graph.generate_device_id();
-
-                            let device_info =
-                                DeviceInfo::new(device_id, node_name.clone(), DeviceType::Physical);
-                            graph.add_device(device_info);
-
-                            device_id
-                        };
-
-                        // Track PipeWire node ID -> our DeviceId
-                        {
-                            let mut node_map = pw_node_map.write().unwrap();
-                            node_map.insert(global_id, device_id);
+                        // Skip monitor sources - we'll add .monitor programmatically when needed
+                        if node_name.ends_with(".monitor") {
+                            return;
                         }
 
-                        // Send event to UI
-                        let _ = event_tx.send(AudioEvent::DeviceAdded {
-                            device_id,
-                            name: node_name,
-                            device_type: DeviceType::Physical,
-                        });
+                        // Check if we already have this node mapped to a device
+                        let existing_device_id = {
+                            let node_map = pw_node_map.read().unwrap();
+                            node_map.get(&global_id).copied()
+                        };
+
+                        // Only create device if it doesn't already exist
+                        if existing_device_id.is_none() {
+                            let device_id = {
+                                let mut graph = routing_graph.write().unwrap();
+                                let device_id = graph.generate_device_id();
+
+                                let device_info =
+                                    DeviceInfo::new(device_id, node_name.clone(), DeviceType::Physical);
+                                graph.add_device(device_info);
+
+                                device_id
+                            };
+
+                            // Track PipeWire node ID -> our DeviceId
+                            {
+                                let mut node_map = pw_node_map.write().unwrap();
+                                node_map.insert(global_id, device_id);
+                            }
+
+                            // Send event to UI
+                            let _ = event_tx.send(AudioEvent::DeviceAdded {
+                                device_id,
+                                name: node_name,
+                                device_type: DeviceType::Physical,
+                            });
+                        }
                     })
                     .register();
 
                 // Store node and listener to keep them alive
                 NODES.with(|nodes| nodes.borrow_mut().push(node));
                 LISTENERS.with(|listeners| listeners.borrow_mut().push(Box::new(listener)));
+
+                // Mark this node as processed
+                PROCESSED_NODES.with(|set| {
+                    set.borrow_mut().insert(obj.id);
+                });
             }
             ObjectType::Port => {
+                // Check if we've already processed this port
+                let already_processed = PROCESSED_PORTS.with(|set| {
+                    set.borrow().contains(&obj.id)
+                });
+
+                if already_processed {
+                    return; // Skip already processed ports
+                }
+
                 // Bind the port proxy
                 let port: Port = match registry.bind(obj) {
                     Ok(port) => port,
@@ -471,6 +510,11 @@ impl PipeWireClient {
                 // Store port and listener to keep them alive
                 PORTS.with(|ports| ports.borrow_mut().push(port));
                 LISTENERS.with(|listeners| listeners.borrow_mut().push(Box::new(listener)));
+
+                // Mark this port as processed
+                PROCESSED_PORTS.with(|set| {
+                    set.borrow_mut().insert(obj.id);
+                });
             }
             ObjectType::Link => {
                 // Bind the link proxy
@@ -749,41 +793,58 @@ impl PipeWireClient {
     /// Handle start visualization command - create an audio capture stream
     fn handle_start_visualization_command(
         core: &pipewire::core::CoreRc,
-        _routing_graph: &Arc<RwLock<RoutingGraph>>,
-        pw_node_map: &Arc<RwLock<HashMap<u32, DeviceId>>>,
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        _pw_node_map: &Arc<RwLock<HashMap<u32, DeviceId>>>,
         event_tx: &Sender<AudioEvent>,
         device_id: DeviceId,
         port_id: PortId,
     ) {
         crate::debug_log!("[DEBUG] Start visualization: device_id={:?}, port_id={:?}", device_id, port_id);
 
-        // Find the PipeWire node ID for this device
-        let pw_node_id = {
-            let node_map = pw_node_map.read().unwrap();
-            crate::debug_log!("[DEBUG] Node map contains {} entries", node_map.len());
-            // Find the entry where the value matches our device_id
-            let found = node_map.iter()
-                .find(|&(_, &dev_id)| dev_id == device_id)
-                .map(|(&pw_id, _)| pw_id);
-            crate::debug_log!("[DEBUG] Found PipeWire node ID: {:?}", found);
-            found
+        // Get device info and port info from routing graph
+        let (node_name, port_direction) = {
+            let graph = routing_graph.read().unwrap();
+            let device = match graph.get_device(device_id) {
+                Some(dev) => dev,
+                None => {
+                    crate::debug_log!("[ERROR] Device {:?} not found in routing graph", device_id);
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Device {:?} not found", device_id),
+                    });
+                    return;
+                }
+            };
+
+            let port = match device.ports.iter().find(|p| p.id == port_id) {
+                Some(p) => p,
+                None => {
+                    crate::debug_log!("[ERROR] Port {:?} not found in device {:?}", port_id, device_id);
+                    let _ = event_tx.send(AudioEvent::Error {
+                        message: format!("Port {:?} not found in device {:?}", port_id, device_id),
+                    });
+                    return;
+                }
+            };
+
+            (device.name.clone(), port.direction)
         };
 
-        if pw_node_id.is_none() {
-            crate::debug_log!("[ERROR] PipeWire node ID not found for device {:?}", device_id);
-            let _ = event_tx.send(AudioEvent::Error {
-                message: format!("PipeWire node ID not found for device {:?}", device_id),
-            });
-            return;
-        }
+        // For output ports, we need to capture from the monitor source
+        use super::types::PortDirection;
+        crate::debug_log!("[DEBUG] Device name: '{}', port direction: {:?}", node_name, port_direction);
+
+        // With JACK, we just pass the node name - the stream will handle JACK port name mapping
+        let target_name = node_name.clone();
+        crate::debug_log!("[DEBUG] Target for JACK: '{}'", target_name);
 
         // Create the audio capture stream
-        crate::debug_log!("[DEBUG] Creating AudioCaptureStream with node_id={:?}", pw_node_id);
+        crate::debug_log!("[CAPTURE] Device '{}' -> Port direction {:?} -> Capture target: '{}'",
+                         node_name, port_direction, target_name);
         match AudioCaptureStream::new(
-            core,
+            &(), // JACK doesn't need core reference
             device_id,
             port_id,
-            pw_node_id,
+            Some(target_name),
             event_tx.clone(),
         ) {
             Ok(stream) => {

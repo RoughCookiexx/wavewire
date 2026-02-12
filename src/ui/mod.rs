@@ -189,13 +189,21 @@ impl App {
                     self.status_message = format!("Visualization stopped for device {:?}", device_id);
                 }
                 AudioEvent::SpectrumUpdate { device_id, data } => {
+                    crate::debug_log!(
+                        "[UI] SpectrumUpdate received: device={:?}, bins={}, samples=[{:.2}, {:.2}, {:.2}]",
+                        device_id,
+                        data.bins.len(),
+                        data.bins.get(0).unwrap_or(&-60.0),
+                        data.bins.get(32).unwrap_or(&-60.0),
+                        data.bins.get(63).unwrap_or(&-60.0)
+                    );
                     self.spectrum_data.insert(*device_id, data.clone());
                 }
             }
         }
     }
 
-    fn refresh_devices(&mut self, audio_engine: &AudioEngine) -> Result<()> {
+    pub fn refresh_devices(&mut self, audio_engine: &AudioEngine) -> Result<()> {
         self.devices = audio_engine.list_devices()?;
         if self.selected_device >= self.devices.len() && !self.devices.is_empty() {
             self.selected_device = self.devices.len() - 1;
@@ -240,8 +248,7 @@ impl App {
     }
 
     pub fn render(&mut self, frame: &mut Frame, audio_engine: &AudioEngine) {
-        // Refresh devices on each render (could be optimized to only refresh on events)
-        let _ = self.refresh_devices(audio_engine);
+        // Note: Device list is refreshed via events and manual refresh ('r' key), not on every render
 
         let terminal_height = frame.area().height;
 
@@ -549,6 +556,14 @@ impl App {
                 } else {
                     -60.0
                 };
+
+                // Diagnostic logging (log occasionally)
+                if device_idx == 0 && bin_idx % 16 == 0 {
+                    crate::debug_log!(
+                        "[RENDER] Device {:?}, bin {}: magnitude={:.2} dB, display_value={}",
+                        device_id, bin_idx, magnitude, ((magnitude + 60.0).max(0.0).min(60.0)) as u64
+                    );
+                }
 
                 // Convert dB to display value (0-60 range, since we store -60 to 0 dB)
                 let display_value = ((magnitude + 60.0).max(0.0).min(60.0)) as u64;

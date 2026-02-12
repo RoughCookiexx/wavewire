@@ -1,10 +1,8 @@
 use anyhow::Result;
 use crossbeam_channel::Sender;
+use jack::{AudioIn, Client, Port};
 use std::collections::VecDeque;
-use std::io::Read;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Instant;
 
 use super::fft::FftProcessor;
@@ -44,11 +42,6 @@ impl RingBuffer {
         self.buffer.len()
     }
 
-    /// Check if the buffer is empty
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
     /// Check if the buffer has enough samples for processing
     pub fn has_enough_samples(&self, required: usize) -> bool {
         self.buffer.len() >= required
@@ -61,15 +54,83 @@ impl RingBuffer {
         let start_index = self.buffer.len().saturating_sub(available);
         self.buffer.iter().skip(start_index).copied().collect()
     }
+}
 
-    /// Clear all samples from the buffer
-    pub fn clear(&mut self) {
-        self.buffer.clear()
+/// JACK audio processor for handling process callbacks
+struct JackProcessor {
+    /// Left channel input port
+    in_left: Port<AudioIn>,
+    /// Right channel input port
+    in_right: Port<AudioIn>,
+    /// Ring buffer for storing samples (shared with main thread)
+    sample_buffer: Arc<Mutex<RingBuffer>>,
+}
+
+impl jack::ProcessHandler for JackProcessor {
+    fn process(&mut self, _client: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
+        use std::cell::Cell;
+        thread_local! {
+            static PROCESS_COUNT: Cell<u32> = Cell::new(0);
+        }
+
+        PROCESS_COUNT.with(|count| {
+            let c = count.get() + 1;
+            count.set(c);
+
+            // Get audio slices from JACK ports
+            let left_samples = self.in_left.as_slice(ps);
+            let right_samples = self.in_right.as_slice(ps);
+
+            // Log first few callbacks
+            if c <= 5 {
+                crate::debug_log!(
+                    "[JACK PROCESS] Callback #{}: {} samples per channel",
+                    c,
+                    left_samples.len()
+                );
+            }
+
+            // Convert stereo to mono and push to ring buffer
+            let mut mono_samples = Vec::with_capacity(left_samples.len());
+            for i in 0..left_samples.len() {
+                let mono = (left_samples[i] + right_samples[i]) / 2.0;
+                mono_samples.push(mono);
+            }
+
+            // Log audio statistics every 100 callbacks
+            if c % 100 == 0 {
+                let max_sample = mono_samples
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let min_sample = mono_samples
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min);
+                let avg_abs = mono_samples.iter().map(|s| s.abs()).sum::<f32>()
+                    / mono_samples.len() as f32;
+                crate::debug_log!(
+                    "[JACK PROCESS] Callback #{}: {} samples, max={:.4}, min={:.4}, avg_abs={:.4}",
+                    c,
+                    mono_samples.len(),
+                    max_sample,
+                    min_sample,
+                    avg_abs
+                );
+            }
+
+            // Push to shared buffer
+            if let Ok(mut buffer) = self.sample_buffer.lock() {
+                buffer.push(&mono_samples);
+            }
+        });
+
+        jack::Control::Continue
     }
 }
 
-/// Audio capture stream for visualization using pw-record subprocess
-/// Captures audio from a specific port and buffers samples for FFT processing
+/// Audio capture stream for visualization using JACK API
+/// Captures audio from monitor ports and buffers samples for FFT processing
 pub struct AudioCaptureStream {
     /// Device ID this stream is capturing from
     device_id: DeviceId,
@@ -85,123 +146,134 @@ pub struct AudioCaptureStream {
     event_tx: Sender<AudioEvent>,
     /// Last FFT processing timestamp
     last_process_time: Instant,
-    /// pw-record subprocess (must be kept alive)
-    _subprocess: Option<Child>,
+    /// JACK client (must be kept alive)
+    _jack_client: jack::AsyncClient<(), JackProcessor>,
 }
 
 impl AudioCaptureStream {
-    /// Create a new audio capture stream using pw-record subprocess
+    /// Create a new audio capture stream using JACK API
     pub fn new(
-        _core: &pipewire::core::CoreRc,
+        _core: &(), // No longer need PipeWire core
         device_id: DeviceId,
         port_id: PortId,
-        pw_node_id: Option<u32>,
+        target_name: Option<String>,
         event_tx: Sender<AudioEvent>,
     ) -> Result<Self> {
-        const DEFAULT_SAMPLE_RATE: u32 = 48000;
         const BUFFER_CAPACITY: usize = 8192;
         const FFT_SIZE: usize = 2048;
         const NUM_BINS: usize = 64;
 
-        crate::debug_log!("[STREAM] Creating pw-record stream for device={:?}, port={:?}, node_id={:?}",
-                  device_id, port_id, pw_node_id);
+        let target = target_name.unwrap_or_else(|| {
+            crate::debug_log!("[JACK] WARNING: No target provided");
+            String::new()
+        });
 
-        // Create ring buffer (thread-safe with Arc<Mutex<>>)
+        crate::debug_log!(
+            "[JACK] Creating capture stream for device={:?}, target={}",
+            device_id,
+            target
+        );
+
+        // Create ring buffer
         let sample_buffer = Arc::new(Mutex::new(RingBuffer::new(BUFFER_CAPACITY)));
-        crate::debug_log!("[STREAM] Ring buffer created with capacity {}", BUFFER_CAPACITY);
+        crate::debug_log!("[JACK] Ring buffer created with capacity {}", BUFFER_CAPACITY);
 
-        // Create FFT processor
-        let fft_processor = FftProcessor::new(FFT_SIZE, NUM_BINS, DEFAULT_SAMPLE_RATE);
-        crate::debug_log!("[STREAM] FFT processor created (size={}, bins={})", FFT_SIZE, NUM_BINS);
+        // Create JACK client
+        let client_name = format!("wavewire_{}", device_id.0);
+        let (client, _status) =
+            jack::Client::new(&client_name, jack::ClientOptions::NO_START_SERVER)?;
 
-        // Spawn pw-record subprocess to capture audio
-        let target = if let Some(node_id) = pw_node_id {
-            node_id.to_string()
-        } else {
-            crate::debug_log!("[STREAM] WARNING: No node ID provided, using @DEFAULT_SINK@");
-            "@DEFAULT_SINK@".to_string()
+        let sample_rate = client.sample_rate();
+        crate::debug_log!(
+            "[JACK] Client created: {}, sample_rate={}Hz",
+            client_name,
+            sample_rate
+        );
+
+        // Create FFT processor with actual JACK sample rate
+        let fft_processor = FftProcessor::new(FFT_SIZE, NUM_BINS, sample_rate as u32);
+
+        // Register input ports (stereo)
+        let in_left = client.register_port("capture_L", jack::AudioIn::default())?;
+        let in_right = client.register_port("capture_R", jack::AudioIn::default())?;
+        crate::debug_log!("[JACK] Registered input ports: capture_L, capture_R");
+
+        // Create processor with shared buffer
+        let processor = JackProcessor {
+            in_left,
+            in_right,
+            sample_buffer: Arc::clone(&sample_buffer),
         };
 
-        crate::debug_log!("[STREAM] Spawning: pw-record --target {} --format f32 --rate 48000 --channels 2 -", target);
+        // Activate the client
+        let async_client = client.activate_async((), processor)?;
+        crate::debug_log!("[JACK] Client activated");
 
-        let mut child = Command::new("pw-record")
-            .arg("--target")
-            .arg(&target)
-            .arg("--format")
-            .arg("f32")
-            .arg("--rate")
-            .arg("48000")
-            .arg("--channels")
-            .arg("2")
-            .arg("-") // Write to stdout
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        // Connect to target ports if specified
+        if !target.is_empty() {
+            let client_ref = async_client.as_client();
 
-        crate::debug_log!("[STREAM] pw-record subprocess spawned");
+            // Get all output ports (potential monitor sources)
+            let all_ports = client_ref.ports(None, None, jack::PortFlags::IS_OUTPUT);
 
-        // Get stdout handle
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            anyhow::anyhow!("Failed to get stdout from pw-record")
-        })?;
+            crate::debug_log!("[JACK] Searching for monitor ports matching target: {}", target);
 
-        // Clone buffer for reader thread
-        let buffer_clone = Arc::clone(&sample_buffer);
+            // Find monitor ports that match our target
+            // Look for ports containing the target name and "monitor"
+            let mut left_port = None;
+            let mut right_port = None;
 
-        // Spawn thread to read from pw-record stdout
-        crate::debug_log!("[STREAM] Starting reader thread");
-        thread::spawn(move || {
-            let mut first_data = true;
-            let mut f32_buffer = [0f32; 2048]; // Read 2048 f32 samples at a time
-            let byte_buffer_size = f32_buffer.len() * std::mem::size_of::<f32>();
-            let mut byte_buffer = vec![0u8; byte_buffer_size];
+            for port_name in all_ports.iter() {
+                // Match ports that contain our target and monitor
+                if port_name.contains("monitor") {
+                    // For virtual sinks like "virtual_out_1", match "virtual_out_1 Audio/Sink sink:monitor_"
+                    // For ALSA devices, the JACK name is different (e.g., "Elgato Wave XLR Analog Stereo")
+                    let matches_target = if target.starts_with("virtual_") || target.starts_with("obs_") {
+                        // Virtual sinks: look for exact prefix match
+                        port_name.starts_with(&target)
+                    } else if target.starts_with("alsa_output") || target.starts_with("alsa_input") {
+                        // ALSA devices: they have friendly names, so just check if it contains "monitor"
+                        // and is output port (we already filtered for output ports above)
+                        true
+                    } else {
+                        port_name.contains(&target)
+                    };
 
-            loop {
-                match stdout.read_exact(&mut byte_buffer) {
-                    Ok(()) => {
-                        if first_data {
-                            crate::debug_log!("[READER] *** FIRST DATA RECEIVED FROM PW-RECORD! ***");
-                            first_data = false;
+                    if matches_target {
+                        if port_name.ends_with("monitor_FL") {
+                            left_port = Some(port_name.clone());
+                            crate::debug_log!("[JACK] Found left monitor port: {}", port_name);
+                        } else if port_name.ends_with("monitor_FR") {
+                            right_port = Some(port_name.clone());
+                            crate::debug_log!("[JACK] Found right monitor port: {}", port_name);
                         }
-
-                        // Convert bytes to f32 samples
-                        for (i, chunk) in byte_buffer.chunks_exact(4).enumerate() {
-                            f32_buffer[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        }
-
-                        // Convert stereo to mono (L,R,L,R -> mono)
-                        let mut mono_samples = Vec::with_capacity(f32_buffer.len() / 2);
-                        for chunk in f32_buffer.chunks_exact(2) {
-                            let mono = (chunk[0] + chunk[1]) / 2.0;
-                            mono_samples.push(mono);
-                        }
-
-                        // Push to ring buffer
-                        buffer_clone.lock().unwrap().push(&mono_samples);
-
-                        // Log occasionally
-                        use std::cell::Cell;
-                        thread_local! {
-                            static READ_COUNT: Cell<u32> = Cell::new(0);
-                        }
-                        READ_COUNT.with(|count| {
-                            let c = count.get() + 1;
-                            count.set(c);
-                            if c % 100 == 0 {
-                                crate::debug_log!("[READER] Read {} chunks, buffer: {} samples",
-                                                 c, buffer_clone.lock().unwrap().len());
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        crate::debug_log!("[READER] Read error: {}, exiting", e);
-                        break;
                     }
                 }
             }
-        });
 
-        crate::debug_log!("[STREAM] Reader thread started");
+            // Try to connect if we found both ports
+            match (&left_port, &right_port) {
+                (Some(left), Some(right)) => {
+                    crate::debug_log!("[JACK] Attempting to connect to {} and {}", left, right);
+
+                    match client_ref.connect_ports_by_name(left, &format!("{}:capture_L", client_name)) {
+                        Ok(_) => {
+                            crate::debug_log!("[JACK] ✓ Connected left channel");
+                            match client_ref.connect_ports_by_name(right, &format!("{}:capture_R", client_name)) {
+                                Ok(_) => crate::debug_log!("[JACK] ✓ Connected right channel"),
+                                Err(e) => crate::debug_log!("[JACK] ✗ Failed to connect right: {}", e),
+                            }
+                        }
+                        Err(e) => crate::debug_log!("[JACK] ✗ Failed to connect left: {}", e),
+                    }
+                }
+                _ => {
+                    crate::debug_log!("[JACK] WARNING: Could not find monitor ports for target: {}", target);
+                    crate::debug_log!("[JACK] Found left: {:?}, Found right: {:?}", left_port, right_port);
+                    crate::debug_log!("[JACK] You may need to connect manually using Helvum or pw-link");
+                }
+            }
+        }
 
         // Send event that visualization started
         let _ = event_tx.send(AudioEvent::VisualizationStarted { device_id, port_id });
@@ -210,11 +282,11 @@ impl AudioCaptureStream {
             device_id,
             port_id,
             sample_buffer,
-            sample_rate: DEFAULT_SAMPLE_RATE,
+            sample_rate: sample_rate as u32,
             fft_processor,
             event_tx,
             last_process_time: Instant::now(),
-            _subprocess: Some(child),
+            _jack_client: async_client,
         })
     }
 
@@ -240,7 +312,10 @@ impl AudioCaptureStream {
 
     /// Check if we have enough samples for FFT processing
     pub fn has_enough_samples(&self, fft_size: usize) -> bool {
-        self.sample_buffer.lock().unwrap().has_enough_samples(fft_size)
+        self.sample_buffer
+            .lock()
+            .unwrap()
+            .has_enough_samples(fft_size)
     }
 
     /// Process buffered audio and send spectrum update
@@ -260,22 +335,35 @@ impl AudioCaptureStream {
 
         // Create spectrum data
         let spectrum_data = SpectrumData {
-            bins,
+            bins: bins.clone(),
             frequencies,
             sample_rate: self.sample_rate,
             timestamp: Instant::now(),
         };
 
+        // Diagnostic logging
+        crate::debug_log!(
+            "[SPECTRUM] Device {:?}: Sending {} bins, sample: [{:.2}, {:.2}, {:.2}]",
+            self.device_id,
+            bins.len(),
+            bins.get(0).unwrap_or(&-60.0),
+            bins.get(32).unwrap_or(&-60.0),
+            bins.get(63).unwrap_or(&-60.0)
+        );
+
         // Send event
-        let _ = self.event_tx.send(AudioEvent::SpectrumUpdate {
+        let send_result = self.event_tx.send(AudioEvent::SpectrumUpdate {
             device_id: self.device_id,
             data: spectrum_data,
         });
+
+        if let Err(e) = send_result {
+            crate::debug_log!("[SPECTRUM] Event send failed: {:?}", e);
+        }
     }
 
     /// Update the stream (process FFT if enough time has passed)
     /// Should be called from the audio thread periodically
-    /// Note: Audio data comes in via the reader thread
     pub fn update(&mut self) {
         // Process spectrum at ~30 Hz
         const PROCESS_INTERVAL_MS: u128 = 33; // ~30 Hz
@@ -292,8 +380,12 @@ impl AudioCaptureStream {
         LAST_LOG.with(|last_log| {
             let mut last = last_log.borrow_mut();
             if last.is_none() || last.unwrap().elapsed().as_secs() >= 1 {
-                crate::debug_log!("[UPDATE] Buffer: {}/{} samples, FFT needs {} samples",
-                         buffer_len, 8192, fft_size);
+                crate::debug_log!(
+                    "[UPDATE] Buffer: {}/{} samples, FFT needs {} samples",
+                    buffer_len,
+                    8192,
+                    fft_size
+                );
                 *last = Some(Instant::now());
             }
         });
@@ -310,12 +402,11 @@ impl AudioCaptureStream {
 
 impl Drop for AudioCaptureStream {
     fn drop(&mut self) {
-        // Kill pw-record subprocess when stream is dropped
-        if let Some(mut child) = self._subprocess.take() {
-            crate::debug_log!("[STREAM] Killing pw-record subprocess for device {:?}", self.device_id);
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::debug_log!(
+            "[JACK] Dropping audio capture stream for device {:?}",
+            self.device_id
+        );
+        // JACK client will be automatically deactivated and cleaned up
     }
 }
 
