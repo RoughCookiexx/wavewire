@@ -3,17 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Standard 10-band graphic EQ frequencies (ISO standard)
+/// Standard 10-band graphic EQ frequencies (modified to match spectrum range)
 pub const GRAPHIC_EQ_BANDS: [f32; 10] = [
-    31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 16000.0,
+    31.0, 63.0, 125.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 20000.0,
 ];
 
 /// Parameters for a single EQ band (serializable for config)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EqBandParams {
-    pub frequency: f32,  // Center frequency (Hz)
-    pub gain_db: f32,    // Gain in dB (-12.0 to +12.0)
-    pub q_value: f32,    // Q factor (0.5 to 5.0, default 1.41)
+    pub frequency: f32, // Center frequency (Hz)
+    pub gain_db: f32,   // Gain in dB (-24.0 to +24.0)
+    pub q_value: f32,   // Q factor (0.5 to 5.0, default 1.41)
 }
 
 impl Default for EqBandParams {
@@ -31,14 +31,14 @@ impl EqBandParams {
     pub fn new(frequency: f32, gain_db: f32, q_value: f32) -> Self {
         Self {
             frequency,
-            gain_db: gain_db.clamp(-12.0, 12.0),
+            gain_db: gain_db.clamp(-24.0, 24.0),
             q_value: q_value.clamp(0.5, 5.0),
         }
     }
 
     /// Clamp parameters to valid ranges
     pub fn clamp(&mut self) {
-        self.gain_db = self.gain_db.clamp(-12.0, 12.0);
+        self.gain_db = self.gain_db.clamp(-24.0, 24.0);
         self.q_value = self.q_value.clamp(0.5, 5.0);
         self.frequency = self.frequency.clamp(20.0, 20000.0);
     }
@@ -80,7 +80,7 @@ impl EqSettings {
     /// Set a specific band's parameters
     pub fn set_band(&mut self, index: usize, gain_db: f32, q_value: f32) {
         if index < 10 {
-            self.bands[index].gain_db = gain_db.clamp(-12.0, 12.0);
+            self.bands[index].gain_db = gain_db.clamp(-24.0, 24.0);
             self.bands[index].q_value = q_value.clamp(0.5, 5.0);
         }
     }
@@ -219,11 +219,11 @@ mod tests {
     #[test]
     fn test_eq_band_params_clamping() {
         let mut params = EqBandParams::new(1000.0, 15.0, 10.0);
-        assert_eq!(params.gain_db, 12.0); // Clamped to max
+        assert_eq!(params.gain_db, 24.0); // Clamped to max
         assert_eq!(params.q_value, 5.0); // Clamped to max
 
         params = EqBandParams::new(1000.0, -20.0, 0.1);
-        assert_eq!(params.gain_db, -12.0); // Clamped to min
+        assert_eq!(params.gain_db, -24.0); // Clamped to min
         assert_eq!(params.q_value, 0.5); // Clamped to min
     }
 
@@ -272,7 +272,7 @@ mod tests {
 
         // Test clamping
         settings.set_band(5, 20.0, 10.0);
-        assert_eq!(settings.bands[5].gain_db, 12.0);
+        assert_eq!(settings.bands[5].gain_db, 24.0);
         assert_eq!(settings.bands[5].q_value, 5.0);
     }
 
@@ -340,7 +340,7 @@ mod tests {
         params.clamp();
 
         assert_eq!(params.frequency, 20000.0);
-        assert_eq!(params.gain_db, 12.0);
+        assert_eq!(params.gain_db, 24.0);
         assert_eq!(params.q_value, 5.0);
     }
 

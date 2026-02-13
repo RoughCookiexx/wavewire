@@ -8,8 +8,8 @@ use ratatui::{
 };
 use termion::event::Key;
 
-use crate::audio::{AudioEngine, AudioEvent, DeviceInfo, EqSettings};
 use crate::audio::{AudioCommand, DeviceId, SpectrumData};
+use crate::audio::{AudioEngine, AudioEvent, DeviceInfo, EqSettings};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -176,14 +176,16 @@ impl App {
             Key::Char('o') => {
                 // Decrease spectrum amplification
                 self.spectrum_amplification = (self.spectrum_amplification - 0.1).max(0.1);
-                self.status_message = format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
+                self.status_message =
+                    format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
                 self.config_dirty = true;
                 self.last_viz_change = Some(Instant::now());
             }
             Key::Char('p') => {
                 // Increase spectrum amplification
                 self.spectrum_amplification = (self.spectrum_amplification + 0.1).min(10.0);
-                self.status_message = format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
+                self.status_message =
+                    format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
                 self.config_dirty = true;
                 self.last_viz_change = Some(Instant::now());
             }
@@ -210,8 +212,10 @@ impl App {
                     if self.eq_enabled_devices.contains(&device_id) {
                         // EQ already enabled, move to spectrum mode
                         self.focus_mode = FocusMode::SpectrumEq;
-                        self.status_message = format!("EQ adjustment mode - h/j: adjust gain, k/l: change band (currently at {}Hz)",
-                            self.get_current_band_frequency());
+                        self.status_message = format!(
+                            "EQ adjustment mode - h/j: adjust gain, k/l: change band (currently at {}Hz)",
+                            self.get_current_band_frequency()
+                        );
                     } else {
                         // Enable EQ
                         self.enable_eq(device_id, audio_engine)?;
@@ -246,28 +250,32 @@ impl App {
                 // Move to previous band
                 if self.selected_eq_band > 0 {
                     self.selected_eq_band -= 1;
-                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                    self.status_message =
+                        format!("Selected band: {}Hz", self.get_current_band_frequency());
                 }
             }
             Key::Char('l') => {
                 // Move to next band
                 if self.selected_eq_band < 9 {
                     self.selected_eq_band += 1;
-                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                    self.status_message =
+                        format!("Selected band: {}Hz", self.get_current_band_frequency());
                 }
             }
             Key::Left => {
                 // Move to previous band (alternative)
                 if self.selected_eq_band > 0 {
                     self.selected_eq_band -= 1;
-                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                    self.status_message =
+                        format!("Selected band: {}Hz", self.get_current_band_frequency());
                 }
             }
             Key::Right => {
                 // Move to next band (alternative)
                 if self.selected_eq_band < 9 {
                     self.selected_eq_band += 1;
-                    self.status_message = format!("Selected band: {}Hz", self.get_current_band_frequency());
+                    self.status_message =
+                        format!("Selected band: {}Hz", self.get_current_band_frequency());
                 }
             }
             _ => {}
@@ -277,7 +285,7 @@ impl App {
     }
 
     fn get_current_band_frequency(&self) -> u32 {
-        const BANDS: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+        const BANDS: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 20000];
         BANDS[self.selected_eq_band]
     }
 
@@ -297,7 +305,7 @@ impl App {
             let device_id = device.id;
             if let Some(settings) = self.eq_settings.get_mut(&device_id) {
                 let current_gain = settings.bands[self.selected_eq_band].gain_db;
-                let new_gain = (current_gain + delta).clamp(-12.0, 12.0);
+                let new_gain = (current_gain + delta).clamp(-24.0, 24.0);
                 settings.bands[self.selected_eq_band].gain_db = new_gain;
 
                 audio_engine.send_command(AudioCommand::SetEqBand {
@@ -307,11 +315,8 @@ impl App {
                     q_value: settings.bands[self.selected_eq_band].q_value,
                 })?;
 
-                self.status_message = format!(
-                    "{}Hz: {:.1}dB",
-                    self.get_current_band_frequency(),
-                    new_gain
-                );
+                self.status_message =
+                    format!("{}Hz: {:.1}dB", self.get_current_band_frequency(), new_gain);
             }
         }
         Ok(())
@@ -376,21 +381,32 @@ impl App {
                     );
                     self.spectrum_data.insert(*device_id, data.clone());
                 }
-                AudioEvent::EqEnabled { device_id, settings } => {
+                AudioEvent::EqEnabled {
+                    device_id,
+                    settings,
+                } => {
                     self.eq_enabled_devices.insert(*device_id);
                     self.eq_settings.insert(*device_id, settings.clone());
-                    let device_name = self.devices.iter()
+                    let device_name = self
+                        .devices
+                        .iter()
                         .find(|d| d.id == *device_id)
                         .map(|d| d.name.as_str())
                         .unwrap_or("device");
-                    self.status_message = format!("EQ enabled! In Helvum: Disconnect sources from '{}', connect them to wavewire_eq, then wavewire_eq to '{}'", device_name, device_name);
+                    self.status_message = format!(
+                        "EQ enabled! In Helvum: Disconnect sources from '{}', connect them to wavewire_eq, then wavewire_eq to '{}'",
+                        device_name, device_name
+                    );
                 }
                 AudioEvent::EqDisabled { device_id } => {
                     self.eq_enabled_devices.remove(device_id);
                     self.eq_settings.remove(device_id);
                     self.status_message = format!("EQ disabled for device {:?}", device_id);
                 }
-                AudioEvent::EqUpdated { device_id, settings } => {
+                AudioEvent::EqUpdated {
+                    device_id,
+                    settings,
+                } => {
                     self.eq_settings.insert(*device_id, settings.clone());
                     self.status_message = format!("EQ updated for device {:?}", device_id);
                 }
@@ -628,9 +644,10 @@ impl App {
             .title_alignment(Alignment::Left);
 
         if self.devices.is_empty() {
-            let paragraph = Paragraph::new("No devices available\n\nPress 'r' to refresh device list")
-                .block(block)
-                .alignment(Alignment::Center);
+            let paragraph =
+                Paragraph::new("No devices available\n\nPress 'r' to refresh device list")
+                    .block(block)
+                    .alignment(Alignment::Center);
             frame.render_widget(paragraph, area);
             return;
         }
@@ -643,44 +660,40 @@ impl App {
         let device_id = device.id;
         let eq_enabled = self.eq_enabled_devices.contains(&device_id);
 
-        let filter_items: Vec<ListItem> = vec![
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    "[",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    if eq_enabled { "x" } else { " " },
-                    Style::default().fg(if eq_enabled { Color::Cyan } else { Color::DarkGray }),
-                ),
-                Span::styled(
-                    "]",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::raw(" "),
-                Span::styled(
-                    "Equalizer",
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(if self.focus_mode == FocusMode::FiltersTab {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                if eq_enabled {
-                    Span::styled(
-                        " (Press Space to adjust)",
-                        Style::default().fg(Color::DarkGray),
-                    )
+        let filter_items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
+            Span::styled("[", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                if eq_enabled { "x" } else { " " },
+                Style::default().fg(if eq_enabled {
+                    Color::Cyan
                 } else {
-                    Span::styled(
-                        " (Press Space to enable)",
-                        Style::default().fg(Color::DarkGray),
-                    )
-                },
-            ])),
-        ];
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled("]", Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(
+                "Equalizer",
+                Style::default().fg(Color::White).add_modifier(
+                    if self.focus_mode == FocusMode::FiltersTab {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                ),
+            ),
+            if eq_enabled {
+                Span::styled(
+                    " (Press Space to adjust)",
+                    Style::default().fg(Color::DarkGray),
+                )
+            } else {
+                Span::styled(
+                    " (Press Space to enable)",
+                    Style::default().fg(Color::DarkGray),
+                )
+            },
+        ]))];
 
         let list = List::new(filter_items)
             .highlight_style(
@@ -692,7 +705,11 @@ impl App {
                     })
                     .add_modifier(Modifier::BOLD),
             )
-            .highlight_symbol(if self.focus_mode == FocusMode::FiltersTab { "> " } else { "  " });
+            .highlight_symbol(if self.focus_mode == FocusMode::FiltersTab {
+                "> "
+            } else {
+                "  "
+            });
 
         frame.render_stateful_widget(
             list,
@@ -707,8 +724,8 @@ impl App {
                 let chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
-                        Constraint::Length(3),  // Filter list
-                        Constraint::Min(0),     // EQ bands display
+                        Constraint::Length(3), // Filter list
+                        Constraint::Min(0),    // EQ bands display
                     ])
                     .split(inner);
 
@@ -716,12 +733,14 @@ impl App {
                 let mut band_lines = vec![
                     Line::from(Span::styled(
                         "EQ Bands (Press Space to adjust in spectrum):",
-                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
                     )),
                     Line::from(""),
                 ];
 
-                const BANDS_HZ: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+                const BANDS_HZ: [u32; 10] = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 20000];
                 for (i, band) in settings.bands.iter().enumerate() {
                     let freq_str = if BANDS_HZ[i] >= 1000 {
                         format!("{}k", BANDS_HZ[i] / 1000)
@@ -748,8 +767,7 @@ impl App {
                     ]));
                 }
 
-                let paragraph = Paragraph::new(band_lines)
-                    .alignment(Alignment::Left);
+                let paragraph = Paragraph::new(band_lines).alignment(Alignment::Left);
                 frame.render_widget(paragraph, chunks[1]);
             }
         }
@@ -1077,25 +1095,79 @@ impl App {
         if self.focus_mode == FocusMode::SpectrumEq && self.devices.len() > self.selected_device {
             let device = &self.devices[self.selected_device];
             if self.eq_enabled_devices.contains(&device.id) {
-                // Calculate which frequency group corresponds to the selected EQ band
-                // We have 10 EQ bands mapped to num_frequency_groups
-                let band_group = (self.selected_eq_band * num_frequency_groups) / 10;
+                // Get the EQ band's center frequency and settings
+                if let Some(eq_settings) = self.eq_settings.get(&device.id) {
+                    let band_params = &eq_settings.bands[self.selected_eq_band];
+                    let center_freq = band_params.frequency;
 
-                // Calculate the x position for this band
-                // Each group has bars_per_group bars
-                let base_x = band_group * bars_per_group;
+                    // Calculate the frequency range affected by this EQ band
+                    // For a peaking EQ, the -3dB bandwidth is related to Q
+                    // bandwidth (octaves) = 2 * asinh(1/(2*Q)) / ln(2)
+                    // For Q=1.41, this is approximately 1 octave
+                    // We'll use a slightly wider range for visualization (±1 octave = 0.5 to 2.0 times center)
+                    let freq_low = center_freq / 2.0;
+                    let freq_high = center_freq * 2.0;
 
-                // Draw vertical lines for the entire group
-                for offset in 0..bars_per_group {
-                    let x = inner.x + (base_x + offset) as u16;
-                    if x < inner.x + inner.width {
-                        // Draw vertical line from top to bottom
-                        for y in 0..inner.height {
-                            let cell_y = inner.y + y;
-                            if let Some(cell) = frame.buffer_mut().cell_mut((x, cell_y)) {
-                                // Use a distinct character for the selection line
-                                cell.set_symbol("│");
-                                cell.set_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+                    // Get spectrum data to access frequency information
+                    if let Some(spectrum) = self.spectrum_data.get(&device.id) {
+                        // Find the leftmost and rightmost display positions for the frequency range
+                        let total_bins = spectrum.bins.len();
+
+                        // Find the first and last bins that fall within the EQ band's frequency range
+                        let mut first_bin = None;
+                        let mut last_bin = None;
+
+                        for (bin_idx, &bin_freq) in spectrum.frequencies.iter().enumerate() {
+                            if bin_freq >= freq_low && bin_freq <= freq_high {
+                                if first_bin.is_none() {
+                                    first_bin = Some(bin_idx);
+                                }
+                                last_bin = Some(bin_idx);
+                            }
+                        }
+
+                        if let (Some(first_bin), Some(last_bin)) = (first_bin, last_bin) {
+                            // Map bins to display groups
+                            let first_group = (first_bin * num_frequency_groups) / total_bins;
+                            let last_group = (last_bin * num_frequency_groups) / total_bins;
+
+                            // Calculate repetition parameters (same as in render_combined_spectrum)
+                            let available_width = inner.width as usize;
+                            let base_repetition = available_width / (num_frequency_groups * bars_per_group);
+                            let total_with_base = num_frequency_groups * bars_per_group * base_repetition;
+                            let extra_bars = available_width - total_with_base;
+
+                            // Helper function to calculate X position for a group accounting for repetitions
+                            let calc_x_position = |group_idx: usize| -> usize {
+                                if group_idx < extra_bars {
+                                    // This group gets extra repetition
+                                    group_idx * (base_repetition + 1) * bars_per_group
+                                } else {
+                                    // This group gets base repetition only
+                                    extra_bars * (base_repetition + 1) * bars_per_group
+                                        + (group_idx - extra_bars) * base_repetition * bars_per_group
+                                }
+                            };
+
+                            // Draw vertical lines only at the boundaries
+                            for &group_idx in &[first_group, last_group] {
+                                let x_pos = calc_x_position(group_idx);
+                                let x = inner.x + x_pos as u16;
+
+                                if x < inner.x + inner.width {
+                                    for y in 0..inner.height {
+                                        let cell_y = inner.y + y;
+                                        if let Some(cell) = frame.buffer_mut().cell_mut((x, cell_y))
+                                        {
+                                            cell.set_symbol("│");
+                                            cell.set_style(
+                                                Style::default()
+                                                    .fg(Color::Yellow)
+                                                    .add_modifier(Modifier::BOLD),
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
