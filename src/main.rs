@@ -60,6 +60,9 @@ fn run_app() -> Result<()> {
     // Initialize UI app
     let mut app = App::new(config.visualization.spectrum_amplification);
 
+    // Restore hidden devices from config
+    app.restore_hidden_devices(config.visualization.hidden_devices.clone());
+
     // Set up non-blocking input handling
     let input_rx = spawn_input_thread();
 
@@ -128,6 +131,7 @@ fn run_app() -> Result<()> {
                 &app.get_visualized_devices(),
                 &devices,
                 app.get_spectrum_amplification(),
+                app.get_hidden_devices(),
             );
             if let Err(e) = config_manager.save(&config) {
                 debug_log!("Auto-save failed: {}", e);
@@ -158,6 +162,7 @@ fn run_app() -> Result<()> {
         &app.get_visualized_devices(),
         &devices,
         app.get_spectrum_amplification(),
+        app.get_hidden_devices(),
     );
     if let Err(e) = config_manager.save(&final_config) {
         debug_log!("Failed to save config on exit: {}", e);

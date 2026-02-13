@@ -93,6 +93,10 @@ pub struct App {
     eq_enabled_devices: HashSet<DeviceId>,
     /// Current EQ settings per device
     eq_settings: HashMap<DeviceId, EqSettings>,
+    /// Device names that are hidden from the device list
+    hidden_devices: HashSet<String>,
+    /// Whether to show hidden devices (greyed out)
+    show_hidden: bool,
 }
 
 impl App {
@@ -113,6 +117,8 @@ impl App {
             selected_eq_band: 0,
             eq_enabled_devices: HashSet::new(),
             eq_settings: HashMap::new(),
+            hidden_devices: HashSet::new(),
+            show_hidden: false,
         }
     }
 
@@ -142,15 +148,41 @@ impl App {
                 self.current_tab = self.current_tab.previous();
             }
             Key::Up | Key::Char('k') => {
-                // Navigate device list
+                // Navigate device list (skip hidden devices if not showing them)
                 if self.selected_device > 0 {
-                    self.selected_device -= 1;
+                    let mut new_index = self.selected_device - 1;
+                    // Skip hidden devices if not showing them
+                    while !self.show_hidden
+                        && new_index > 0
+                        && self.devices.get(new_index).map(|d| self.hidden_devices.contains(&d.name)).unwrap_or(false)
+                    {
+                        new_index -= 1;
+                    }
+                    // Check if the found device is visible or we reached the top
+                    if self.show_hidden
+                        || !self.devices.get(new_index).map(|d| self.hidden_devices.contains(&d.name)).unwrap_or(false)
+                    {
+                        self.selected_device = new_index;
+                    }
                 }
             }
             Key::Down | Key::Char('j') => {
-                // Navigate device list
+                // Navigate device list (skip hidden devices if not showing them)
                 if !self.devices.is_empty() && self.selected_device + 1 < self.devices.len() {
-                    self.selected_device += 1;
+                    let mut new_index = self.selected_device + 1;
+                    // Skip hidden devices if not showing them
+                    while !self.show_hidden
+                        && new_index + 1 < self.devices.len()
+                        && self.devices.get(new_index).map(|d| self.hidden_devices.contains(&d.name)).unwrap_or(false)
+                    {
+                        new_index += 1;
+                    }
+                    // Check if the found device is visible or we reached the bottom
+                    if self.show_hidden
+                        || !self.devices.get(new_index).map(|d| self.hidden_devices.contains(&d.name)).unwrap_or(false)
+                    {
+                        self.selected_device = new_index;
+                    }
                 }
             }
             Key::Char('\n') => {
@@ -188,6 +220,54 @@ impl App {
                     format!("Spectrum amplification: {:.1}", self.spectrum_amplification);
                 self.config_dirty = true;
                 self.last_viz_change = Some(Instant::now());
+            }
+            Key::Char('h') => {
+                // Hide selected device
+                if let Some(device) = self.devices.get(self.selected_device) {
+                    let device_name = device.name.clone();
+                    if self.hidden_devices.contains(&device_name) {
+                        // Unhide device
+                        self.hidden_devices.remove(&device_name);
+                        self.status_message = format!("Unhidden device: {}", device_name);
+                    } else {
+                        // Hide device
+                        self.hidden_devices.insert(device_name.clone());
+                        self.status_message = format!("Hidden device: {}", device_name);
+
+                        // If not showing hidden devices, move selection to next visible device
+                        if !self.show_hidden {
+                            // Find next visible device
+                            let mut found_visible = false;
+                            for i in (self.selected_device + 1)..self.devices.len() {
+                                if !self.hidden_devices.contains(&self.devices[i].name) {
+                                    self.selected_device = i;
+                                    found_visible = true;
+                                    break;
+                                }
+                            }
+                            // If no visible device found after current, search before
+                            if !found_visible {
+                                for i in (0..self.selected_device).rev() {
+                                    if !self.hidden_devices.contains(&self.devices[i].name) {
+                                        self.selected_device = i;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.config_dirty = true;
+                    self.last_viz_change = Some(Instant::now());
+                }
+            }
+            Key::Char('H') => {
+                // Toggle showing hidden devices
+                self.show_hidden = !self.show_hidden;
+                self.status_message = if self.show_hidden {
+                    String::from("Showing hidden devices (greyed out)")
+                } else {
+                    String::from("Hiding hidden devices")
+                };
             }
             _ => {}
         }
@@ -512,28 +592,46 @@ impl App {
     }
 
     fn render_device_list(&self, frame: &mut Frame, area: Rect) {
+        // Build the filtered list and track the mapping from full list to filtered list
+        let mut filtered_index = 0;
+        let mut selected_filtered_index = None;
+
         let items: Vec<ListItem> = self
             .devices
             .iter()
-            .map(|device| {
+            .enumerate()
+            .filter_map(|(idx, device)| {
+                let is_hidden = self.hidden_devices.contains(&device.name);
+
+                // Skip hidden devices if not showing them
+                if is_hidden && !self.show_hidden {
+                    return None;
+                }
+
                 let device_type = format!("{:?}", device.device_type);
                 let is_visualized = self.visualized_devices.contains(&device.id);
                 let indicator = if is_visualized { "[x]" } else { "[ ]" };
+
+                // Grey out hidden devices when showing them
+                let (name_color, indicator_color) = if is_hidden {
+                    (Color::DarkGray, Color::DarkGray)
+                } else if is_visualized {
+                    (Color::White, Color::Cyan)
+                } else {
+                    (Color::White, Color::DarkGray)
+                };
+
                 let line = Line::from(vec![
                     Span::styled(
                         indicator,
-                        Style::default().fg(if is_visualized {
-                            Color::Cyan
-                        } else {
-                            Color::DarkGray
-                        }),
+                        Style::default().fg(indicator_color),
                     ),
                     Span::raw(" "),
                     Span::styled(
                         &device.name,
                         Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
+                            .fg(name_color)
+                            .add_modifier(if is_hidden { Modifier::empty() } else { Modifier::BOLD }),
                     ),
                     Span::raw(" "),
                     Span::styled(
@@ -541,7 +639,14 @@ impl App {
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]);
-                ListItem::new(line)
+
+                // Track which filtered index corresponds to the selected device
+                if idx == self.selected_device {
+                    selected_filtered_index = Some(filtered_index);
+                }
+                filtered_index += 1;
+
+                Some(ListItem::new(line))
             })
             .collect();
 
@@ -562,7 +667,7 @@ impl App {
         frame.render_stateful_widget(
             list,
             area,
-            &mut ratatui::widgets::ListState::default().with_selected(Some(self.selected_device)),
+            &mut ratatui::widgets::ListState::default().with_selected(selected_filtered_index),
         );
     }
 
@@ -1218,7 +1323,11 @@ impl App {
                     Span::styled("Enter", Style::default().fg(Color::Cyan)),
                     Span::raw(": filters  "),
                     Span::styled("Space", Style::default().fg(Color::Cyan)),
-                    Span::raw(": viz"),
+                    Span::raw(": viz  "),
+                    Span::styled("h", Style::default().fg(Color::Cyan)),
+                    Span::raw(": hide  "),
+                    Span::styled("H", Style::default().fg(Color::Cyan)),
+                    Span::raw(": show hidden"),
                 ]);
             }
             FocusMode::FiltersTab => {
@@ -1281,5 +1390,15 @@ impl App {
     /// Find a device by name
     pub fn find_device_by_name(&self, name: &str) -> Option<&DeviceInfo> {
         self.devices.iter().find(|d| d.name == name)
+    }
+
+    /// Get hidden devices as Vec<String> for config saving
+    pub fn get_hidden_devices(&self) -> Vec<String> {
+        self.hidden_devices.iter().cloned().collect()
+    }
+
+    /// Restore hidden devices from config
+    pub fn restore_hidden_devices(&mut self, hidden_device_names: Vec<String>) {
+        self.hidden_devices = hidden_device_names.into_iter().collect();
     }
 }

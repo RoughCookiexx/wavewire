@@ -23,6 +23,9 @@ pub struct VisualizationConfig {
     /// Spectrum amplification factor (default: 2.0)
     #[serde(default = "default_amplification")]
     pub spectrum_amplification: f32,
+    /// Device names that are hidden from the device list
+    #[serde(default)]
+    pub hidden_devices: Vec<String>,
 }
 
 fn default_amplification() -> f32 {
@@ -34,6 +37,7 @@ impl Default for VisualizationConfig {
         Self {
             enabled_devices: Vec::new(),
             spectrum_amplification: default_amplification(),
+            hidden_devices: Vec::new(),
         }
     }
 }
@@ -53,6 +57,7 @@ impl Config {
         visualized_ids: &HashSet<DeviceId>,
         all_devices: &[DeviceInfo],
         spectrum_amplification: f32,
+        hidden_devices: Vec<String>,
     ) -> Self {
         let enabled_devices = all_devices
             .iter()
@@ -64,6 +69,7 @@ impl Config {
             visualization: VisualizationConfig {
                 enabled_devices,
                 spectrum_amplification,
+                hidden_devices,
             },
             eq: EqConfig::default(),
         }
