@@ -2,6 +2,7 @@ use std::fmt;
 use std::time::Instant;
 
 use super::eq::EqSettings;
+use super::volume::VolumeSettings;
 
 /// Unique identifier for an audio device
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -155,6 +156,11 @@ pub enum AudioCommand {
     ResetEq {
         device_id: DeviceId,
     },
+    /// Set volume for a device
+    SetVolume {
+        device_id: DeviceId,
+        settings: VolumeSettings,
+    },
 }
 
 /// Events sent from audio thread to UI thread
@@ -209,6 +215,11 @@ pub enum AudioEvent {
     EqUpdated {
         device_id: DeviceId,
         settings: EqSettings,
+    },
+    /// Volume was updated for a device
+    VolumeUpdated {
+        device_id: DeviceId,
+        settings: VolumeSettings,
     },
 }
 

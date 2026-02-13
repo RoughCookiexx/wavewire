@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::eq::EqSettings;
 use super::types::{DeviceId, DeviceType, PortId, PortInfo};
+use super::volume::VolumeSettings;
 
 /// Information about an audio device
 #[derive(Debug, Clone)]
@@ -11,6 +12,7 @@ pub struct DeviceInfo {
     pub device_type: DeviceType,
     pub ports: Vec<PortInfo>,
     pub eq_settings: Option<EqSettings>,
+    pub volume_settings: Option<VolumeSettings>,
 }
 
 impl DeviceInfo {
@@ -21,6 +23,7 @@ impl DeviceInfo {
             device_type,
             ports: Vec::new(),
             eq_settings: None,
+            volume_settings: None,
         }
     }
 }
@@ -98,9 +101,11 @@ impl RoutingGraph {
         self.devices.get_mut(&device_id)
     }
 
-    /// List all devices
+    /// List all devices (sorted by ID for stable ordering)
     pub fn list_devices(&self) -> Vec<&DeviceInfo> {
-        self.devices.values().collect()
+        let mut devices: Vec<&DeviceInfo> = self.devices.values().collect();
+        devices.sort_by_key(|d| d.id.0);
+        devices
     }
 
     /// Add a connection to the graph

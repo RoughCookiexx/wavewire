@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
-use crate::audio::{DeviceId, DeviceInfo, EqSettings};
+use crate::audio::{DeviceId, DeviceInfo, EqSettings, VolumeSettings};
 use crate::debug_log;
 
 /// Main configuration structure
@@ -13,6 +13,8 @@ pub struct Config {
     pub visualization: VisualizationConfig,
     #[serde(default)]
     pub eq: EqConfig,
+    #[serde(default)]
+    pub volume: VolumeConfig,
 }
 
 /// Configuration for spectrum visualization
@@ -50,6 +52,14 @@ pub struct EqConfig {
     pub device_settings: HashMap<String, EqSettings>,
 }
 
+/// Configuration for volume settings per device
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VolumeConfig {
+    /// Map of device name → volume settings
+    /// Uses device names (not IDs) for persistence across sessions
+    pub device_settings: HashMap<String, VolumeSettings>,
+}
+
 impl Config {
     /// Create config from current app state
     /// Extracts device names for all visualized devices
@@ -72,6 +82,7 @@ impl Config {
                 hidden_devices,
             },
             eq: EqConfig::default(),
+            volume: VolumeConfig::default(),
         }
     }
 }

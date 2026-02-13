@@ -5,10 +5,12 @@ mod fft;
 mod graph;
 mod stream;
 mod types;
+mod volume;
 
 pub use eq::{EqBandParams, EqSettings, GRAPHIC_EQ_BANDS};
 pub use graph::DeviceInfo;
 pub use types::{AudioCommand, AudioEvent, DeviceId, DeviceType, PortDirection, PortId, PortInfo, SpectrumData};
+pub use volume::{VolumeSettings, VolumeProcessor, update_volume_settings};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};

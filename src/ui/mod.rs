@@ -9,7 +9,7 @@ use ratatui::{
 use termion::event::Key;
 
 use crate::audio::{AudioCommand, DeviceId, SpectrumData};
-use crate::audio::{AudioEngine, AudioEvent, DeviceInfo, EqSettings};
+use crate::audio::{AudioEngine, AudioEvent, DeviceInfo, EqSettings, VolumeSettings};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -61,8 +61,6 @@ impl DeviceTab {
 enum FocusMode {
     /// Normal mode: device list focus
     DeviceList,
-    /// Filters tab: focused on filter options
-    FiltersTab,
     /// Spectrum mode: EQ band adjustment
     SpectrumEq,
 }
@@ -93,6 +91,8 @@ pub struct App {
     eq_enabled_devices: HashSet<DeviceId>,
     /// Current EQ settings per device
     eq_settings: HashMap<DeviceId, EqSettings>,
+    /// Current volume settings per device
+    volume_settings: HashMap<DeviceId, VolumeSettings>,
     /// Device names that are hidden from the device list
     hidden_devices: HashSet<String>,
     /// Whether to show hidden devices (greyed out)
@@ -117,6 +117,7 @@ impl App {
             selected_eq_band: 0,
             eq_enabled_devices: HashSet::new(),
             eq_settings: HashMap::new(),
+            volume_settings: HashMap::new(),
             hidden_devices: HashSet::new(),
             show_hidden: false,
         }
@@ -126,7 +127,6 @@ impl App {
         // Handle input based on focus mode
         match self.focus_mode {
             FocusMode::DeviceList => self.handle_device_list_input(key, audio_engine)?,
-            FocusMode::FiltersTab => self.handle_filters_tab_input(key, audio_engine)?,
             FocusMode::SpectrumEq => self.handle_spectrum_eq_input(key, audio_engine)?,
         }
 
@@ -185,11 +185,27 @@ impl App {
                     }
                 }
             }
-            Key::Char('\n') => {
-                // Enter key: move focus to filters tab
-                if self.current_tab == DeviceTab::Filters {
-                    self.focus_mode = FocusMode::FiltersTab;
-                    self.status_message = String::from("Filters tab - Press Space to enable EQ");
+            Key::Char('e') => {
+                // Enable EQ and jump to EQ mode for selected device
+                if let Some(device) = self.devices.get(self.selected_device) {
+                    let device_id = device.id;
+                    if self.eq_enabled_devices.contains(&device_id) {
+                        // EQ already enabled, jump to spectrum mode
+                        self.focus_mode = FocusMode::SpectrumEq;
+                        self.status_message = format!(
+                            "EQ adjustment mode - j/k: adjust gain, h/l: change band (currently at {}Hz)",
+                            self.get_current_band_frequency()
+                        );
+                    } else {
+                        // Enable EQ first, then jump to spectrum mode
+                        if let Ok(()) = self.enable_eq(device_id, audio_engine) {
+                            self.focus_mode = FocusMode::SpectrumEq;
+                            self.status_message = format!(
+                                "EQ enabled! Adjustment mode - j/k: adjust gain, h/l: change band (currently at {}Hz)",
+                                self.get_current_band_frequency()
+                            );
+                        }
+                    }
                 }
             }
             Key::Char('r') => {
@@ -269,38 +285,13 @@ impl App {
                     String::from("Hiding hidden devices")
                 };
             }
-            _ => {}
-        }
-
-        Ok(())
-    }
-
-    fn handle_filters_tab_input(&mut self, key: Key, audio_engine: &mut AudioEngine) -> Result<()> {
-        match key {
-            Key::Char('q') | Key::Ctrl('c') => {
-                self.running = false;
+            Key::Char(',') => {
+                // Decrease volume
+                self.adjust_volume(-3.0, audio_engine)?;
             }
-            Key::Esc | Key::Backspace => {
-                // Return to device list mode
-                self.focus_mode = FocusMode::DeviceList;
-                self.status_message = String::from("Returned to device list");
-            }
-            Key::Char(' ') => {
-                // Toggle EQ for selected device
-                if let Some(device) = self.devices.get(self.selected_device) {
-                    let device_id = device.id;
-                    if self.eq_enabled_devices.contains(&device_id) {
-                        // EQ already enabled, move to spectrum mode
-                        self.focus_mode = FocusMode::SpectrumEq;
-                        self.status_message = format!(
-                            "EQ adjustment mode - h/j: adjust gain, k/l: change band (currently at {}Hz)",
-                            self.get_current_band_frequency()
-                        );
-                    } else {
-                        // Enable EQ
-                        self.enable_eq(device_id, audio_engine)?;
-                    }
-                }
+            Key::Char('.') => {
+                // Increase volume
+                self.adjust_volume(3.0, audio_engine)?;
             }
             _ => {}
         }
@@ -314,20 +305,20 @@ impl App {
                 self.running = false;
             }
             Key::Esc | Key::Char(' ') | Key::Backspace => {
-                // Return to filters tab
-                self.focus_mode = FocusMode::FiltersTab;
-                self.status_message = String::from("Returned to filters tab");
+                // Return to device list
+                self.focus_mode = FocusMode::DeviceList;
+                self.status_message = String::from("Returned to device list");
             }
-            Key::Char('h') => {
-                // Increase gain at selected band
+            Key::Char('k') => {
+                // Increase gain at selected band (up)
                 self.adjust_eq_gain(1.0, audio_engine)?;
             }
             Key::Char('j') => {
-                // Decrease gain at selected band
+                // Decrease gain at selected band (down)
                 self.adjust_eq_gain(-1.0, audio_engine)?;
             }
-            Key::Char('k') => {
-                // Move to previous band
+            Key::Char('h') => {
+                // Move to previous band (left)
                 if self.selected_eq_band > 0 {
                     self.selected_eq_band -= 1;
                     self.status_message =
@@ -335,7 +326,7 @@ impl App {
                 }
             }
             Key::Char('l') => {
-                // Move to next band
+                // Move to next band (right)
                 if self.selected_eq_band < 9 {
                     self.selected_eq_band += 1;
                     self.status_message =
@@ -375,8 +366,10 @@ impl App {
             device_id,
             settings: settings.clone(),
         })?;
-        // Don't optimistically update state - wait for EqEnabled event confirmation
-        self.status_message = String::from("Enabling EQ... (check logs for errors)");
+        // Optimistically update state for immediate UI responsiveness
+        self.eq_enabled_devices.insert(device_id);
+        self.eq_settings.insert(device_id, settings.clone());
+        self.status_message = String::from("Enabling EQ...");
         Ok(())
     }
 
@@ -398,6 +391,44 @@ impl App {
                 self.status_message =
                     format!("{}Hz: {:.1}dB", self.get_current_band_frequency(), new_gain);
             }
+        }
+        Ok(())
+    }
+
+    fn adjust_volume(&mut self, delta_db: f32, audio_engine: &AudioEngine) -> Result<()> {
+        if let Some(device) = self.devices.get(self.selected_device) {
+            let device_id = device.id;
+
+            // Get current settings or default
+            let mut settings = self.volume_settings
+                .get(&device_id)
+                .cloned()
+                .unwrap_or_default();
+
+            // Adjust gain in dB (clamp to -60.0 to +6.0)
+            settings.gain_db = (settings.gain_db + delta_db).clamp(-60.0, 6.0);
+
+            // Convert to linear: linear = 10^(dB/20)
+            settings.gain_linear = 10f32.powf(settings.gain_db / 20.0);
+
+            // Send command
+            audio_engine.send_command(AudioCommand::SetVolume {
+                device_id,
+                settings: settings.clone(),
+            })?;
+
+            // Update local state
+            self.volume_settings.insert(device_id, settings.clone());
+            self.config_dirty = true;
+            self.last_viz_change = Some(Instant::now());
+
+            // Show status message
+            self.status_message = format!(
+                "{}: {:+.1} dB ({}%)",
+                device.name,
+                settings.gain_db,
+                (settings.gain_linear * 100.0) as i32
+            );
         }
         Ok(())
     }
@@ -489,6 +520,12 @@ impl App {
                 } => {
                     self.eq_settings.insert(*device_id, settings.clone());
                     self.status_message = format!("EQ updated for device {:?}", device_id);
+                }
+                AudioEvent::VolumeUpdated {
+                    device_id,
+                    settings,
+                } => {
+                    self.volume_settings.insert(*device_id, settings.clone());
                 }
             }
         }
@@ -621,7 +658,18 @@ impl App {
                     (Color::White, Color::DarkGray)
                 };
 
-                let line = Line::from(vec![
+                // Volume indicator
+                let volume_str = if let Some(vol) = self.volume_settings.get(&device.id) {
+                    if (vol.gain_db - 0.0).abs() < 0.1 {
+                        String::new()  // Don't show if at unity gain
+                    } else {
+                        format!(" [{:+.1}dB]", vol.gain_db)
+                    }
+                } else {
+                    String::new()
+                };
+
+                let mut spans = vec![
                     Span::styled(
                         indicator,
                         Style::default().fg(indicator_color),
@@ -638,7 +686,16 @@ impl App {
                         format!("({})", device_type),
                         Style::default().fg(Color::DarkGray),
                     ),
-                ]);
+                ];
+
+                if !volume_str.is_empty() {
+                    spans.push(Span::styled(
+                        volume_str,
+                        Style::default().fg(Color::Yellow),
+                    ));
+                }
+
+                let line = Line::from(spans);
 
                 // Track which filtered index corresponds to the selected device
                 if idx == self.selected_device {
@@ -779,51 +836,27 @@ impl App {
             Span::raw(" "),
             Span::styled(
                 "Equalizer",
-                Style::default().fg(Color::White).add_modifier(
-                    if self.focus_mode == FocusMode::FiltersTab {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    },
-                ),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
             if eq_enabled {
                 Span::styled(
-                    " (Press Space to adjust)",
+                    " (Press 'e' in device list to adjust)",
                     Style::default().fg(Color::DarkGray),
                 )
             } else {
                 Span::styled(
-                    " (Press Space to enable)",
+                    " (Press 'e' in device list to enable)",
                     Style::default().fg(Color::DarkGray),
                 )
             },
         ]))];
 
-        let list = List::new(filter_items)
-            .highlight_style(
-                Style::default()
-                    .bg(if self.focus_mode == FocusMode::FiltersTab {
-                        Color::DarkGray
-                    } else {
-                        Color::Reset
-                    })
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(if self.focus_mode == FocusMode::FiltersTab {
-                "> "
-            } else {
-                "  "
-            });
+        let list = List::new(filter_items);
 
-        frame.render_stateful_widget(
-            list,
-            inner,
-            &mut ratatui::widgets::ListState::default().with_selected(Some(self.selected_filter)),
-        );
+        frame.render_widget(list, inner);
 
         // Show EQ settings if enabled
-        if eq_enabled && self.focus_mode == FocusMode::FiltersTab {
+        if eq_enabled {
             if let Some(settings) = self.eq_settings.get(&device_id) {
                 // Split the area to show EQ bands
                 let chunks = Layout::default()
@@ -837,7 +870,7 @@ impl App {
                 // Render EQ bands
                 let mut band_lines = vec![
                     Line::from(Span::styled(
-                        "EQ Bands (Press Space to adjust in spectrum):",
+                        "EQ Bands (Press 'e' to adjust):",
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -1320,31 +1353,25 @@ impl App {
                     Span::raw(": switch tab  "),
                     Span::styled("↑/↓", Style::default().fg(Color::Cyan)),
                     Span::raw(": select  "),
-                    Span::styled("Enter", Style::default().fg(Color::Cyan)),
-                    Span::raw(": filters  "),
+                    Span::styled("e", Style::default().fg(Color::Cyan)),
+                    Span::raw(": EQ  "),
                     Span::styled("Space", Style::default().fg(Color::Cyan)),
                     Span::raw(": viz  "),
+                    Span::styled(",/.", Style::default().fg(Color::Cyan)),
+                    Span::raw(": volume  "),
                     Span::styled("h", Style::default().fg(Color::Cyan)),
                     Span::raw(": hide  "),
                     Span::styled("H", Style::default().fg(Color::Cyan)),
                     Span::raw(": show hidden"),
                 ]);
             }
-            FocusMode::FiltersTab => {
-                help_spans.extend_from_slice(&[
-                    Span::styled("Esc/⌫", Style::default().fg(Color::Cyan)),
-                    Span::raw(": back  "),
-                    Span::styled("Space", Style::default().fg(Color::Cyan)),
-                    Span::raw(": toggle/adjust EQ"),
-                ]);
-            }
             FocusMode::SpectrumEq => {
                 help_spans.extend_from_slice(&[
                     Span::styled("Esc/⌫", Style::default().fg(Color::Cyan)),
                     Span::raw(": back  "),
-                    Span::styled("k/l", Style::default().fg(Color::Cyan)),
+                    Span::styled("h/l", Style::default().fg(Color::Cyan)),
                     Span::raw(": band  "),
-                    Span::styled("h/j", Style::default().fg(Color::Cyan)),
+                    Span::styled("j/k", Style::default().fg(Color::Cyan)),
                     Span::raw(": gain"),
                 ]);
             }

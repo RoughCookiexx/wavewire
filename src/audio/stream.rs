@@ -8,6 +8,7 @@ use std::time::Instant;
 use super::eq::EqProcessor;
 use super::fft::FftProcessor;
 use super::types::{AudioEvent, DeviceId, PortId, SpectrumData};
+use super::volume::VolumeProcessor;
 
 /// Ring buffer for audio samples
 /// Stores incoming audio samples in a circular buffer for FFT processing
@@ -218,33 +219,38 @@ impl AudioCaptureStream {
             let all_ports = client_ref.ports(None, None, jack::PortFlags::IS_OUTPUT);
 
             crate::debug_log!("[JACK] Searching for monitor ports matching target: {}", target);
+            crate::debug_log!("[JACK] All available output ports:");
+            for port in all_ports.iter() {
+                crate::debug_log!("[JACK]   - {}", port);
+            }
 
             // Find monitor ports that match our target
             // Look for ports containing the target name and "monitor"
             let mut left_port = None;
             let mut right_port = None;
 
+            // Normalize target for case-insensitive matching
+            let target_lower = target.to_lowercase();
+
             for port_name in all_ports.iter() {
-                // Match ports that contain our target and monitor
-                if port_name.contains("monitor") {
-                    // For virtual sinks like "virtual_out_1", match "virtual_out_1 Audio/Sink sink:monitor_"
-                    // For ALSA devices, the JACK name is different (e.g., "Elgato Wave XLR Analog Stereo")
-                    let matches_target = if target.starts_with("virtual_") || target.starts_with("obs_") {
-                        // Virtual sinks: look for exact prefix match
-                        port_name.starts_with(&target)
-                    } else if target.starts_with("alsa_output") || target.starts_with("alsa_input") {
-                        // ALSA devices: they have friendly names, so just check if it contains "monitor"
-                        // and is output port (we already filtered for output ports above)
-                        true
-                    } else {
-                        port_name.contains(&target)
-                    };
+                let port_name_lower = port_name.to_lowercase();
+
+                // Match ports that contain "monitor"
+                if port_name_lower.contains("monitor") {
+                    // Try multiple matching strategies to find the correct monitor port:
+                    // 1. Check if port name starts with target (works for virtual_, obs_, etc.)
+                    // 2. Check if port name contains target (works for most applications)
+                    // Both checks are case-insensitive to handle variations
+                    let matches_target = port_name_lower.starts_with(&target_lower)
+                        || port_name_lower.contains(&target_lower);
 
                     if matches_target {
-                        if port_name.ends_with("monitor_FL") {
+                        crate::debug_log!("[JACK] Port '{}' matches target '{}' (case-insensitive)", port_name, target);
+
+                        if port_name.ends_with("monitor_FL") || port_name_lower.ends_with("monitor_fl") {
                             left_port = Some(port_name.clone());
                             crate::debug_log!("[JACK] Found left monitor port: {}", port_name);
-                        } else if port_name.ends_with("monitor_FR") {
+                        } else if port_name.ends_with("monitor_FR") || port_name_lower.ends_with("monitor_fr") {
                             right_port = Some(port_name.clone());
                             crate::debug_log!("[JACK] Found right monitor port: {}", port_name);
                         }
@@ -423,6 +429,8 @@ struct JackEqProcessor {
     out_right: Port<AudioOut>,
     /// EQ processor
     eq_processor: EqProcessor,
+    /// Volume processor
+    volume_processor: VolumeProcessor,
 }
 
 impl jack::ProcessHandler for JackEqProcessor {
@@ -435,9 +443,15 @@ impl jack::ProcessHandler for JackEqProcessor {
         let out_left = self.out_left.as_mut_slice(ps);
         let out_right = self.out_right.as_mut_slice(ps);
 
-        // Process each sample through EQ
+        // Process each sample through EQ, then volume
         for i in 0..in_left.len() {
-            let (l, r) = self.eq_processor.process_sample(in_left[i], in_right[i]);
+            // 1. Apply EQ
+            let (mut l, mut r) = self.eq_processor.process_sample(in_left[i], in_right[i]);
+
+            // 2. Apply volume
+            (l, r) = self.volume_processor.process_sample(l, r);
+
+            // 3. Write output
             out_left[i] = l;
             out_right[i] = r;
         }
@@ -456,9 +470,13 @@ pub struct AudioProcessingStream {
     /// JACK client (must be kept alive)
     _jack_client: jack::AsyncClient<(), JackEqProcessor>,
     /// Update flag for EQ settings (shared with processor)
-    update_flag: Arc<std::sync::atomic::AtomicBool>,
+    eq_update_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Pending settings for EQ (shared with processor)
-    pending_settings: Arc<Mutex<Option<super::eq::EqSettings>>>,
+    eq_pending_settings: Arc<Mutex<Option<super::eq::EqSettings>>>,
+    /// Update flag for volume settings (shared with processor)
+    volume_update_flag: Arc<std::sync::atomic::AtomicBool>,
+    /// Pending settings for volume (shared with processor)
+    volume_pending_settings: Arc<Mutex<Option<super::volume::VolumeSettings>>>,
 }
 
 impl AudioProcessingStream {
@@ -498,7 +516,11 @@ impl AudioProcessingStream {
 
         // Create EQ processor
         let eq_processor = EqProcessor::new(sample_rate as f32, eq_settings);
-        let (update_flag, pending_settings) = eq_processor.get_update_handles();
+        let (eq_update_flag, eq_pending_settings) = eq_processor.get_update_handles();
+
+        // Create volume processor (default to unity gain)
+        let volume_processor = VolumeProcessor::new(super::volume::VolumeSettings::default());
+        let (volume_update_flag, volume_pending_settings) = volume_processor.get_update_handles();
 
         let processor = JackEqProcessor {
             in_left,
@@ -506,6 +528,7 @@ impl AudioProcessingStream {
             out_left,
             out_right,
             eq_processor,
+            volume_processor,
         };
 
         // Activate client
@@ -601,14 +624,21 @@ impl AudioProcessingStream {
             device_id,
             sample_rate: sample_rate as u32,
             _jack_client: async_client,
-            update_flag,
-            pending_settings,
+            eq_update_flag,
+            eq_pending_settings,
+            volume_update_flag,
+            volume_pending_settings,
         })
     }
 
     /// Update EQ settings from another thread (non-blocking)
     pub fn update_eq(&self, new_settings: super::eq::EqSettings) {
-        super::eq::update_eq_settings(&self.update_flag, &self.pending_settings, new_settings);
+        super::eq::update_eq_settings(&self.eq_update_flag, &self.eq_pending_settings, new_settings);
+    }
+
+    /// Update volume settings from another thread (non-blocking)
+    pub fn update_volume(&self, new_settings: super::volume::VolumeSettings) {
+        super::volume::update_volume_settings(&self.volume_update_flag, &self.volume_pending_settings, new_settings);
     }
 
     /// Get the device ID for this stream

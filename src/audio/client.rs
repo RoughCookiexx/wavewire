@@ -12,6 +12,7 @@ use std::thread::{self, JoinHandle};
 use super::device::VirtualDevice;
 use super::eq::EqSettings;
 use super::graph::{DeviceInfo, RoutingGraph};
+use super::volume::VolumeSettings;
 use super::stream::{AudioCaptureStream, AudioProcessingStream};
 use super::types::{
     AudioCommand, AudioEvent, DeviceId, DeviceType, PortDirection, PortId, PortInfo,
@@ -298,6 +299,14 @@ impl PipeWireClient {
                                 device_id,
                             );
                         }
+                        Ok(AudioCommand::SetVolume { device_id, settings }) => {
+                            Self::handle_set_volume_command(
+                                &routing_graph_cmd,
+                                &event_tx_cmd,
+                                device_id,
+                                settings,
+                            );
+                        }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => {
                             // Command channel closed, quit the loop
                             main_loop_cmd.quit();
@@ -405,10 +414,15 @@ impl PipeWireClient {
                     .info(move |info| {
                         let props = info.props();
 
-                        // Extract node name
+                        // Extract node name - check multiple properties
+                        // Priority: media.name (most specific, used by browser tabs) >
+                        //           node.nick > node.description > application.name > node.name
                         let node_name = props
-                            .and_then(|p| p.get("node.name"))
+                            .and_then(|p| p.get("media.name"))
+                            .or_else(|| props.and_then(|p| p.get("node.nick")))
                             .or_else(|| props.and_then(|p| p.get("node.description")))
+                            .or_else(|| props.and_then(|p| p.get("application.name")))
+                            .or_else(|| props.and_then(|p| p.get("node.name")))
                             .unwrap_or("Unknown Node")
                             .to_string();
 
@@ -525,8 +539,14 @@ impl PipeWireClient {
                                 .unwrap_or(PortDirection::Output);
 
                             // Generate full PipeWire port name
-                            let node_name =
-                                props.and_then(|p| p.get("node.name")).unwrap_or("unknown");
+                            // Use the same property priority as node naming
+                            let node_name = props
+                                .and_then(|p| p.get("media.name"))
+                                .or_else(|| props.and_then(|p| p.get("node.nick")))
+                                .or_else(|| props.and_then(|p| p.get("node.description")))
+                                .or_else(|| props.and_then(|p| p.get("application.name")))
+                                .or_else(|| props.and_then(|p| p.get("node.name")))
+                                .unwrap_or("unknown");
                             let pw_port_name = format!("{}:{}", node_name, port_name);
 
                             // Add port to device
@@ -1260,6 +1280,40 @@ impl PipeWireClient {
             } else {
                 let _ = event_tx.send(AudioEvent::Error {
                     message: format!("No EQ stream found for device {:?}", device_id),
+                });
+            }
+        });
+    }
+
+    /// Handle set volume command - update volume settings for a device
+    fn handle_set_volume_command(
+        routing_graph: &Arc<RwLock<RoutingGraph>>,
+        event_tx: &Sender<AudioEvent>,
+        device_id: DeviceId,
+        settings: VolumeSettings,
+    ) {
+        crate::debug_log!("[VOLUME] Set volume for device {:?}: {:+.1} dB", device_id, settings.gain_db);
+
+        PROCESSING_STREAMS.with(|streams| {
+            if let Some(stream) = streams.borrow().get(&device_id) {
+                stream.update_volume(settings.clone());
+
+                // Update routing graph
+                {
+                    let mut graph = routing_graph.write().unwrap();
+                    if let Some(device) = graph.get_device_mut(device_id) {
+                        device.volume_settings = Some(settings.clone());
+                    }
+                }
+
+                // Send update event
+                let _ = event_tx.send(AudioEvent::VolumeUpdated {
+                    device_id,
+                    settings,
+                });
+            } else {
+                let _ = event_tx.send(AudioEvent::Error {
+                    message: format!("No volume stream found for device {:?}", device_id),
                 });
             }
         });
